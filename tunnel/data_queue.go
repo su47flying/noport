@@ -59,15 +59,27 @@ func (dq *DataQueue) AddConn(conn net.Conn) (*MuxSession, error) {
 	return session, nil
 }
 
-// GetSession returns a MuxSession from the pool using round-robin selection.
-// Returns error if pool is empty or closed.
+// GetSession returns an active MuxSession from the pool using round-robin selection.
+// Skips and removes closed sessions. Returns error if pool is empty or closed.
 func (dq *DataQueue) GetSession() (*MuxSession, error) {
-	dq.mu.RLock()
-	defer dq.mu.RUnlock()
+	dq.mu.Lock()
+	defer dq.mu.Unlock()
 
 	if dq.closed {
 		return nil, ErrPoolClosed
 	}
+
+	// Remove dead sessions first
+	alive := dq.sessions[:0]
+	for _, s := range dq.sessions {
+		if !s.IsClosed() {
+			alive = append(alive, s)
+		} else {
+			slog.Debug("data queue: pruned dead session")
+		}
+	}
+	dq.sessions = alive
+
 	if len(dq.sessions) == 0 {
 		return nil, ErrNoConnections
 	}

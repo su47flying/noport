@@ -108,6 +108,11 @@ func (s *MuxSession) Close() error {
 	return s.conn.Close()
 }
 
+// IsClosed returns whether the session has been closed.
+func (s *MuxSession) IsClosed() bool {
+	return s.closed.Load()
+}
+
 // NumStreams returns the number of active streams.
 func (s *MuxSession) NumStreams() int {
 	s.mu.RLock()

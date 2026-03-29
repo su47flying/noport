@@ -65,12 +65,12 @@ func parseEndpoint(raw string) (Endpoint, error) {
 		return Endpoint{}, fmt.Errorf("invalid endpoint format %q: expected scheme://host:port", raw)
 	}
 
-	scheme := parts[0]
+	scheme := strings.ToLower(parts[0])
 	hostPort := parts[1]
 
 	// Normalize scheme: known schemes pass through, unknown defaults to chacha20
 	switch scheme {
-	case "admin", "socks5", "xor":
+	case "admin", "socks5", "xor", "chacha20":
 		// keep as-is
 	default:
 		scheme = "chacha20"
