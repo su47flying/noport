@@ -278,12 +278,22 @@ func (s *Server) getSessionWithRetry() (*tunnel.MuxSession, error) {
 			return session, nil
 		}
 
-		slog.Debug("no session available, requesting data connection", "attempt", i+1)
+		poolSize := s.dataQueue.Size()
+		slog.Warn("no data session available, requesting from client",
+			"attempt", i+1,
+			"max_retries", maxRetries,
+			"pool_size", poolSize,
+			"err", err,
+		)
 		s.requestDataConn()
 		time.Sleep(retryDelay)
 	}
 
-	return nil, fmt.Errorf("no data connections available after retries")
+	poolSize := s.dataQueue.Size()
+	slog.Error("EXHAUSTED: no data connections after all retries",
+		"pool_size", poolSize,
+	)
+	return nil, fmt.Errorf("no data connections available after retries (pool_size=%d)", poolSize)
 }
 
 // writeTargetToStream writes the target address as a length-prefixed string

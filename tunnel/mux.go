@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,22 @@ const (
 	FlagReset byte = 0x03
 
 	maxMuxPayload = 65536 // 64KB max payload per frame
+)
+
+// Buffer pools to reduce GC pressure on hot paths
+var (
+	frameBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, MuxHeaderLen+maxMuxPayload)
+			return &b
+		},
+	}
+	payloadBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, maxMuxPayload)
+			return &b
+		},
+	}
 )
 
 // MuxSession manages multiplexed streams over a single net.Conn.
@@ -43,7 +60,7 @@ func NewMuxSession(conn net.Conn, isServer bool) *MuxSession {
 	s := &MuxSession{
 		conn:     conn,
 		streams:  make(map[uint32]*MuxStream),
-		accept:   make(chan *MuxStream, 64),
+		accept:   make(chan *MuxStream, 256),
 		isServer: isServer,
 		done:     make(chan struct{}),
 	}
@@ -143,10 +160,14 @@ func (s *MuxSession) serve() {
 			return
 		}
 
+		// Use pooled buffer for payload to reduce allocations
 		var payload []byte
+		var payloadBufp *[]byte
 		if length > 0 {
-			payload = make([]byte, length)
+			payloadBufp = payloadBufPool.Get().(*[]byte)
+			payload = (*payloadBufp)[:length]
 			if _, err := io.ReadFull(s.conn, payload); err != nil {
+				payloadBufPool.Put(payloadBufp)
 				if !s.closed.Load() {
 					slog.Debug("mux serve: read payload error", "err", err)
 				}
@@ -195,6 +216,11 @@ func (s *MuxSession) serve() {
 				st.closeLocal()
 			}
 		}
+
+		// Return pooled payload buffer (pushData copies into bytes.Buffer)
+		if payloadBufp != nil {
+			payloadBufPool.Put(payloadBufp)
+		}
 	}
 }
 
@@ -205,8 +231,12 @@ func (s *MuxSession) writeFrame(streamID uint32, flag byte, data []byte) error {
 		return fmt.Errorf("mux session closed")
 	}
 
-	// Combine header + data into one buffer for a single write
-	buf := make([]byte, MuxHeaderLen+len(data))
+	frameLen := MuxHeaderLen + len(data)
+
+	// Use pooled buffer to reduce allocations on hot path
+	bufp := frameBufPool.Get().(*[]byte)
+	buf := (*bufp)[:frameLen]
+
 	binary.BigEndian.PutUint32(buf[0:4], streamID)
 	buf[4] = flag
 	binary.BigEndian.PutUint32(buf[5:9], uint32(len(data)))
@@ -215,9 +245,10 @@ func (s *MuxSession) writeFrame(streamID uint32, flag byte, data []byte) error {
 	}
 
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
 	_, err := s.conn.Write(buf)
+	s.writeMu.Unlock()
+
+	frameBufPool.Put(bufp)
 	return err
 }
 
@@ -234,11 +265,12 @@ type MuxStream struct {
 	id      uint32
 	session *MuxSession
 
-	mu      sync.Mutex
-	cond    *sync.Cond
-	buf     bytes.Buffer // incoming data buffer
-	closed  atomic.Bool
-	closeCh chan struct{}
+	mu           sync.Mutex
+	cond         *sync.Cond
+	buf          bytes.Buffer // incoming data buffer
+	closed       atomic.Bool
+	closeCh      chan struct{}
+	readDeadline time.Time // guarded by mu
 }
 
 func newMuxStream(id uint32, session *MuxSession) *MuxStream {
@@ -260,7 +292,7 @@ func (st *MuxStream) pushData(data []byte) {
 }
 
 // Read reads data from the stream's buffer.
-// Blocks until data is available or the stream is closed.
+// Blocks until data is available, the stream is closed, or the read deadline expires.
 func (st *MuxStream) Read(p []byte) (int, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -269,7 +301,22 @@ func (st *MuxStream) Read(p []byte) (int, error) {
 		if st.closed.Load() {
 			return 0, io.EOF
 		}
-		st.cond.Wait()
+
+		dl := st.readDeadline
+		if !dl.IsZero() {
+			d := time.Until(dl)
+			if d <= 0 {
+				return 0, os.ErrDeadlineExceeded
+			}
+			// Timer wakes us up when the deadline expires
+			timer := time.AfterFunc(d, func() {
+				st.cond.Broadcast()
+			})
+			st.cond.Wait()
+			timer.Stop()
+		} else {
+			st.cond.Wait()
+		}
 	}
 	return st.buf.Read(p)
 }
@@ -325,10 +372,14 @@ func (st *MuxStream) RemoteAddr() net.Addr {
 }
 
 func (st *MuxStream) SetDeadline(t time.Time) error {
-	return nil
+	return st.SetReadDeadline(t)
 }
 
 func (st *MuxStream) SetReadDeadline(t time.Time) error {
+	st.mu.Lock()
+	st.readDeadline = t
+	st.mu.Unlock()
+	st.cond.Broadcast() // wake up any blocked readers to check deadline
 	return nil
 }
 

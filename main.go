@@ -10,7 +10,18 @@ import (
 	"noport/pkg"
 )
 
+// Set via -ldflags at build time, defaults to "dev"
+var version = "0.0.1"
+
 func main() {
+	// Handle -version before flag.Parse (which happens in ParseConfig)
+	for _, arg := range os.Args[1:] {
+		if arg == "-version" || arg == "--version" || arg == "-v" {
+			fmt.Printf("noport version %s\n", version)
+			os.Exit(0)
+		}
+	}
+
 	cfg, err := pkg.ParseConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -19,7 +30,7 @@ func main() {
 
 	pkg.InitLogger(cfg.Debug)
 
-	slog.Info("noport starting", "mode", modeStr(cfg))
+	slog.Info("noport starting", "version", version, "mode", modeStr(cfg))
 
 	if cfg.IsClient() {
 		if err := cmd.RunClient(cfg); err != nil {

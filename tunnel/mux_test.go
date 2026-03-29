@@ -261,3 +261,84 @@ func TestSessionCloseClosesAllStreams(t *testing.T) {
 		t.Errorf("expected 0 streams after close, got %d", client.NumStreams())
 	}
 }
+
+func TestMuxStreamSetReadDeadline(t *testing.T) {
+a, b := net.Pipe()
+defer a.Close()
+defer b.Close()
+
+server := NewMuxSession(a, true)
+defer server.Close()
+client := NewMuxSession(b, false)
+defer client.Close()
+
+// Server opens a stream
+stream, err := server.Open()
+if err != nil {
+t.Fatal(err)
+}
+
+// Accept on client side
+cStream, err := client.Accept()
+if err != nil {
+t.Fatal(err)
+}
+
+// Test 1: SetReadDeadline in the past should cause Read to return immediately
+cStream.SetReadDeadline(time.Now().Add(-1 * time.Second))
+buf := make([]byte, 10)
+_, err = cStream.Read(buf)
+if err == nil {
+t.Fatal("expected error from Read after deadline expired")
+}
+
+// Test 2: SetReadDeadline(time.Now()) should unblock a goroutine blocked in Read
+done := make(chan error, 1)
+go func() {
+stream.SetReadDeadline(time.Time{}) // clear any deadline
+buf := make([]byte, 10)
+_, err := stream.Read(buf)
+done <- err
+}()
+
+// Give goroutine time to block in Read
+time.Sleep(50 * time.Millisecond)
+
+// Unblock by setting deadline in the past
+stream.SetReadDeadline(time.Now())
+
+select {
+case err := <-done:
+if err == nil {
+t.Fatal("expected error from Read")
+}
+t.Logf("Read returned expected error: %v", err)
+case <-time.After(2 * time.Second):
+t.Fatal("Read did not unblock after SetReadDeadline(time.Now())")
+}
+
+// Test 3: Future deadline with data arriving before it
+stream2, err := server.Open()
+if err != nil {
+t.Fatal(err)
+}
+cStream2, err := client.Accept()
+if err != nil {
+t.Fatal(err)
+}
+
+cStream2.SetReadDeadline(time.Now().Add(5 * time.Second))
+go func() {
+time.Sleep(50 * time.Millisecond)
+stream2.Write([]byte("hello"))
+}()
+
+buf2 := make([]byte, 10)
+n, err := cStream2.Read(buf2)
+if err != nil {
+t.Fatalf("expected no error, got: %v", err)
+}
+if string(buf2[:n]) != "hello" {
+t.Fatalf("expected 'hello', got %q", string(buf2[:n]))
+}
+}

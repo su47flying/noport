@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"noport/protocol"
@@ -12,7 +13,12 @@ import (
 const (
 	socks5HandshakeTimeout = 10 * time.Second
 	socks5StreamTimeout    = 15 * time.Second
+	relayBufSize           = 128 << 10 // 128KB
 )
+
+var relayBufPool = sync.Pool{
+	New: func() any { return make([]byte, relayBufSize) },
+}
 
 // handleSocks5Conn handles a single SOCKS5 connection.
 func (s *Server) handleSocks5Conn(conn net.Conn) {
@@ -38,12 +44,14 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 	conn.SetDeadline(time.Time{})
 
 	target := req.Target()
-	slog.Debug("socks5 connect", "target", target, "remote", remote)
+	poolSize, totalStreams := s.dataQueue.Stats()
+	slog.Debug("socks5 connect", "target", target, "remote", remote,
+		"pool_size", poolSize, "active_streams", totalStreams)
 
 	// Step 3: Get a MuxSession from data queue (with retry)
 	session, err := s.getSessionWithRetry()
 	if err != nil {
-		slog.Error("no session for socks5", "err", err, "target", target)
+		slog.Error("no session for socks5", "err", err, "target", target, "remote", remote)
 		protocol.WriteSocks5Reply(conn, protocol.RepGeneralFailure, nil, 0)
 		return
 	}
@@ -51,7 +59,8 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 	// Step 4: Open a mux stream
 	stream, err := session.Open()
 	if err != nil {
-		slog.Error("failed to open stream", "err", err, "target", target)
+		slog.Error("failed to open stream", "err", err, "target", target,
+			"pool_size", s.dataQueue.Size(), "session_streams", session.NumStreams())
 		protocol.WriteSocks5Reply(conn, protocol.RepGeneralFailure, nil, 0)
 		return
 	}
@@ -96,7 +105,9 @@ func relay(left, right net.Conn) {
 	done := make(chan struct{})
 
 	go func() {
-		io.Copy(right, left)
+		buf := relayBufPool.Get().([]byte)
+		io.CopyBuffer(right, left, buf)
+		relayBufPool.Put(buf)
 		// Signal the other direction to stop
 		if tc, ok := right.(interface{ CloseWrite() error }); ok {
 			tc.CloseWrite()
@@ -106,7 +117,9 @@ func relay(left, right net.Conn) {
 		close(done)
 	}()
 
-	io.Copy(left, right)
+	buf := relayBufPool.Get().([]byte)
+	io.CopyBuffer(left, right, buf)
+	relayBufPool.Put(buf)
 	if tc, ok := left.(interface{ CloseWrite() error }); ok {
 		tc.CloseWrite()
 	} else {

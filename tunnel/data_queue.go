@@ -109,6 +109,17 @@ func (dq *DataQueue) Size() int {
 	return len(dq.sessions)
 }
 
+// Stats returns pool_size and total active streams across all sessions.
+func (dq *DataQueue) Stats() (poolSize int, totalStreams int) {
+	dq.mu.RLock()
+	defer dq.mu.RUnlock()
+	poolSize = len(dq.sessions)
+	for _, s := range dq.sessions {
+		totalStreams += s.NumStreams()
+	}
+	return
+}
+
 // Close closes all sessions and the pool.
 func (dq *DataQueue) Close() error {
 	dq.mu.Lock()

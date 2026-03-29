@@ -4,7 +4,16 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 )
+
+// xorBufPool reduces allocations in the hot write path
+var xorBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 128<<10) // 128KB initial capacity
+		return &b
+	},
+}
 
 // xorCipher implements Cipher using XOR encryption.
 type xorCipher struct {
@@ -69,10 +78,21 @@ type xorWriter struct {
 }
 
 func (w *xorWriter) Write(p []byte) (int, error) {
-	buf := make([]byte, len(p))
+	bufp := xorBufPool.Get().(*[]byte)
+	buf := (*bufp)
+	if cap(buf) < len(p) {
+		buf = make([]byte, len(p))
+	} else {
+		buf = buf[:len(p)]
+	}
+
 	for i := 0; i < len(p); i++ {
 		buf[i] = p[i] ^ w.key[w.pos%len(w.key)]
 		w.pos++
 	}
-	return w.writer.Write(buf)
+	n, err := w.writer.Write(buf)
+
+	*bufp = buf
+	xorBufPool.Put(bufp)
+	return n, err
 }

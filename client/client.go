@@ -20,8 +20,8 @@ import (
 )
 
 const (
-	initialDataConns = 3
-	minDataConns     = 2
+	initialDataConns = 10
+	minDataConns     = 5
 	dialTimeout      = 10 * time.Second
 )
 
@@ -204,19 +204,22 @@ func (c *Client) onAdminMessage(msg *protocol.AdminMessage) {
 
 // monitorDataConns periodically checks pool size and replenishes if needed.
 func (c *Client) monitorDataConns() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			size := c.dataQueue.Size()
-			if size < minDataConns {
-				slog.Info("data pool below minimum, adding connections", "current", size, "min", minDataConns)
-				for i := size; i < initialDataConns; i++ {
+			poolSize, totalStreams := c.dataQueue.Stats()
+			if poolSize < minDataConns {
+				slog.Warn("data pool below minimum, adding connections",
+					"current", poolSize, "min", minDataConns, "active_streams", totalStreams)
+				for i := poolSize; i < initialDataConns; i++ {
 					if err := c.connectData(); err != nil {
 						slog.Warn("failed to replenish data connection", "err", err)
 					}
 				}
+			} else {
+				slog.Debug("data pool status", "pool_size", poolSize, "active_streams", totalStreams)
 			}
 		case <-c.ctx.Done():
 			return
