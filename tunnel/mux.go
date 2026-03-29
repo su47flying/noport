@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -19,7 +20,7 @@ const (
 	FlagClose byte = 0x02
 	FlagReset byte = 0x03
 
-	maxMuxPayload = 32768 // 32KB max payload per frame
+	maxMuxPayload = 65536 // 64KB max payload per frame
 )
 
 // MuxSession manages multiplexed streams over a single net.Conn.
@@ -180,12 +181,7 @@ func (s *MuxSession) serve() {
 				continue
 			}
 			if len(payload) > 0 {
-				select {
-				case st.readBuf <- payload:
-				case <-st.closeCh:
-				case <-s.done:
-					return
-				}
+				st.pushData(payload)
 			}
 
 		case FlagClose, FlagReset:
@@ -203,28 +199,26 @@ func (s *MuxSession) serve() {
 }
 
 // writeFrame writes a single mux frame to the underlying conn (thread-safe).
+// Header and payload are combined into a single write to avoid interleaving.
 func (s *MuxSession) writeFrame(streamID uint32, flag byte, data []byte) error {
 	if s.closed.Load() {
 		return fmt.Errorf("mux session closed")
 	}
 
-	header := make([]byte, MuxHeaderLen)
-	binary.BigEndian.PutUint32(header[0:4], streamID)
-	header[4] = flag
-	binary.BigEndian.PutUint32(header[5:9], uint32(len(data)))
+	// Combine header + data into one buffer for a single write
+	buf := make([]byte, MuxHeaderLen+len(data))
+	binary.BigEndian.PutUint32(buf[0:4], streamID)
+	buf[4] = flag
+	binary.BigEndian.PutUint32(buf[5:9], uint32(len(data)))
+	if len(data) > 0 {
+		copy(buf[MuxHeaderLen:], data)
+	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	if _, err := s.conn.Write(header); err != nil {
-		return err
-	}
-	if len(data) > 0 {
-		if _, err := s.conn.Write(data); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := s.conn.Write(buf)
+	return err
 }
 
 func (s *MuxSession) removeStream(id uint32) {
@@ -235,58 +229,49 @@ func (s *MuxSession) removeStream(id uint32) {
 
 // MuxStream represents a single multiplexed stream within a MuxSession.
 // It implements the net.Conn interface.
+// Uses bytes.Buffer + sync.Cond instead of channel to avoid head-of-line blocking.
 type MuxStream struct {
-	id       uint32
-	session  *MuxSession
-	readBuf  chan []byte
-	readLeft []byte
-	closed   atomic.Bool
-	closeCh  chan struct{}
+	id      uint32
+	session *MuxSession
+
+	mu      sync.Mutex
+	cond    *sync.Cond
+	buf     bytes.Buffer // incoming data buffer
+	closed  atomic.Bool
+	closeCh chan struct{}
 }
 
 func newMuxStream(id uint32, session *MuxSession) *MuxStream {
-	return &MuxStream{
+	st := &MuxStream{
 		id:      id,
 		session: session,
-		readBuf: make(chan []byte, 256),
 		closeCh: make(chan struct{}),
 	}
+	st.cond = sync.NewCond(&st.mu)
+	return st
 }
 
-// Read reads data from the stream.
-func (st *MuxStream) Read(p []byte) (int, error) {
-	if len(st.readLeft) > 0 {
-		n := copy(p, st.readLeft)
-		st.readLeft = st.readLeft[n:]
-		return n, nil
-	}
+// pushData appends data to the stream's buffer (called by serve(), never blocks).
+func (st *MuxStream) pushData(data []byte) {
+	st.mu.Lock()
+	st.buf.Write(data)
+	st.mu.Unlock()
+	st.cond.Signal()
+}
 
-	select {
-	case data, ok := <-st.readBuf:
-		if !ok {
+// Read reads data from the stream's buffer.
+// Blocks until data is available or the stream is closed.
+func (st *MuxStream) Read(p []byte) (int, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	for st.buf.Len() == 0 {
+		if st.closed.Load() {
 			return 0, io.EOF
 		}
-		n := copy(p, data)
-		if n < len(data) {
-			st.readLeft = data[n:]
-		}
-		return n, nil
-	case <-st.closeCh:
-		// Drain remaining buffered data before returning EOF.
-		select {
-		case data, ok := <-st.readBuf:
-			if !ok {
-				return 0, io.EOF
-			}
-			n := copy(p, data)
-			if n < len(data) {
-				st.readLeft = data[n:]
-			}
-			return n, nil
-		default:
-			return 0, io.EOF
-		}
+		st.cond.Wait()
 	}
+	return st.buf.Read(p)
 }
 
 // Write writes data to the stream, splitting into frames if necessary.
@@ -318,6 +303,7 @@ func (st *MuxStream) Close() error {
 	st.session.removeStream(st.id)
 	err := st.session.writeFrame(st.id, FlagClose, nil)
 	close(st.closeCh)
+	st.cond.Broadcast() // wake up any blocked readers
 	return err
 }
 
@@ -327,6 +313,7 @@ func (st *MuxStream) closeLocal() {
 		return
 	}
 	close(st.closeCh)
+	st.cond.Broadcast() // wake up any blocked readers
 }
 
 func (st *MuxStream) LocalAddr() net.Addr {

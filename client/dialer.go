@@ -4,27 +4,36 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"sync"
+	"time"
 )
 
 // relay copies data bidirectionally between two net.Conn.
-// Blocks until both directions are done.
+// When one direction finishes, the other is terminated promptly.
 func relay(a, b net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
+	done := make(chan struct{})
 
-	copyFn := func(dst, src net.Conn) {
-		defer wg.Done()
-		_, err := io.Copy(dst, src)
+	go func() {
+		_, err := io.Copy(a, b)
 		if err != nil {
 			slog.Debug("relay copy error", "err", err)
 		}
-		if tc, ok := dst.(*net.TCPConn); ok {
+		if tc, ok := a.(interface{ CloseWrite() error }); ok {
 			tc.CloseWrite()
+		} else {
+			a.SetReadDeadline(time.Now())
 		}
+		close(done)
+	}()
+
+	_, err := io.Copy(b, a)
+	if err != nil {
+		slog.Debug("relay copy error", "err", err)
+	}
+	if tc, ok := b.(interface{ CloseWrite() error }); ok {
+		tc.CloseWrite()
+	} else {
+		b.SetReadDeadline(time.Now())
 	}
 
-	go copyFn(a, b)
-	go copyFn(b, a)
-	wg.Wait()
+	<-done
 }

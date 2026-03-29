@@ -4,7 +4,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"sync"
 	"time"
 
 	"noport/protocol"
@@ -92,26 +91,27 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 }
 
 // relay copies data bidirectionally between two connections.
+// When one direction finishes, the other is terminated promptly.
 func relay(left, right net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
+	done := make(chan struct{})
 
 	go func() {
-		defer wg.Done()
 		io.Copy(right, left)
-		// Signal write-done to the other side if possible
+		// Signal the other direction to stop
 		if tc, ok := right.(interface{ CloseWrite() error }); ok {
 			tc.CloseWrite()
+		} else {
+			right.SetReadDeadline(time.Now())
 		}
+		close(done)
 	}()
 
-	go func() {
-		defer wg.Done()
-		io.Copy(left, right)
-		if tc, ok := left.(interface{ CloseWrite() error }); ok {
-			tc.CloseWrite()
-		}
-	}()
+	io.Copy(left, right)
+	if tc, ok := left.(interface{ CloseWrite() error }); ok {
+		tc.CloseWrite()
+	} else {
+		left.SetReadDeadline(time.Now())
+	}
 
-	wg.Wait()
+	<-done
 }
