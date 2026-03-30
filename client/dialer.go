@@ -15,13 +15,15 @@ var relayBufPool = sync.Pool{
 
 // relay copies data bidirectionally between two net.Conn.
 // When one direction finishes, the other is terminated promptly.
-// Returns bytes transferred in each direction.
-func relay(a, b net.Conn) (aToB int64, bToA int64) {
+// Returns (fromB, fromA):
+//   - fromB: bytes read from b and written to a
+//   - fromA: bytes read from a and written to b
+func relay(a, b net.Conn) (fromB int64, fromA int64) {
 	done := make(chan struct{})
 
 	go func() {
 		buf := relayBufPool.Get().([]byte)
-		aToB, _ = io.CopyBuffer(a, b, buf)
+		fromB, _ = io.CopyBuffer(a, b, buf)
 		relayBufPool.Put(buf)
 		if tc, ok := a.(interface{ CloseWrite() error }); ok {
 			tc.CloseWrite()
@@ -32,7 +34,7 @@ func relay(a, b net.Conn) (aToB int64, bToA int64) {
 	}()
 
 	buf := relayBufPool.Get().([]byte)
-	bToA, _ = io.CopyBuffer(b, a, buf)
+	fromA, _ = io.CopyBuffer(b, a, buf)
 	relayBufPool.Put(buf)
 	if tc, ok := b.(interface{ CloseWrite() error }); ok {
 		tc.CloseWrite()

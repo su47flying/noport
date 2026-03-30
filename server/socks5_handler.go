@@ -12,7 +12,6 @@ import (
 
 const (
 	socks5HandshakeTimeout = 10 * time.Second
-	socks5StreamTimeout    = 15 * time.Second
 	relayBufSize           = 128 << 10 // 128KB
 )
 
@@ -73,29 +72,17 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 		return
 	}
 
-	// Step 6: Read 1-byte response from client (0x00 = success), with timeout
-	stream.SetDeadline(time.Now().Add(socks5StreamTimeout))
-	var resp [1]byte
-	if _, err := io.ReadFull(stream, resp[:]); err != nil {
-		slog.Error("failed to read stream response", "err", err, "target", target)
-		protocol.WriteSocks5Reply(conn, protocol.RepHostUnreach, nil, 0)
-		return
-	}
-	stream.SetDeadline(time.Time{})
-
-	if resp[0] != 0x00 {
-		slog.Debug("client reported failure for target", "target", target, "code", resp[0])
-		protocol.WriteSocks5Reply(conn, protocol.RepHostUnreach, nil, 0)
-		return
-	}
-
-	// Step 7: Send SOCKS5 success reply
+	// Step 6: Send SOCKS5 success reply immediately (optimistic, no round-trip wait).
+	// Client will dial target and start relay in parallel. If client can't connect,
+	// it closes the stream and the relay terminates — APP sees a broken connection
+	// and retries. This saves one full tunnel round-trip (~200ms), critical for
+	// latency-sensitive connections like YouTube CDN.
 	if err := protocol.WriteSocks5Reply(conn, protocol.RepSuccess, net.IPv4zero, 0); err != nil {
 		slog.Error("failed to write socks5 reply", "err", err, "target", target)
 		return
 	}
 
-	// Step 8: Relay data bidirectionally
+	// Step 7: Relay data bidirectionally
 	stats := relay(conn, stream)
 	slog.Info("relay done", "target", target,
 		"duration", stats.duration.Round(time.Millisecond),

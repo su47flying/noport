@@ -257,27 +257,24 @@ func (c *Client) handleStream(stream *tunnel.MuxStream) {
 	}
 	target := string(addrBuf)
 
-	// Dial the actual target
+	// Dial the actual target (no success byte — server already told APP "OK").
+	// Any data APP sends during dial is buffered in MuxStream's bytes.Buffer.
 	targetConn, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
-		slog.Debug("dial target failed", "target", target, "err", err)
-		stream.Write([]byte{0x01})
-		return
+		slog.Warn("dial target failed", "target", target, "err", err)
+		return // stream.Close() via defer will notify server
 	}
 	defer targetConn.Close()
 
-	// Signal success
-	if _, err := stream.Write([]byte{0x00}); err != nil {
-		slog.Debug("write success byte failed", "err", err)
-		return
-	}
-
 	slog.Debug("relaying", "target", target)
 	start := time.Now()
-	streamToTarget, targetToStream := relay(stream, targetConn)
+	// relay returns (fromB, fromA) where a=stream, b=targetConn:
+	//   fromB = bytes from targetConn written to stream (target response)
+	//   fromA = bytes from stream written to targetConn (data forwarded to target)
+	fromTarget, toTarget := relay(stream, targetConn)
 	slog.Info("relay done", "target", target,
 		"duration", time.Since(start).Round(time.Millisecond),
-		"from_server", streamToTarget,
-		"from_target", targetToStream,
+		"to_target", toTarget,
+		"from_target", fromTarget,
 	)
 }
