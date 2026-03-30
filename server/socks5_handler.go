@@ -96,17 +96,32 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 	}
 
 	// Step 8: Relay data bidirectionally
-	relay(conn, stream)
+	stats := relay(conn, stream)
+	slog.Info("relay done", "target", target,
+		"duration", stats.duration.Round(time.Millisecond),
+		"upload", stats.upload,
+		"download", stats.download,
+	)
+}
+
+// relayResult holds stats from a bidirectional relay.
+type relayResult struct {
+	upload   int64         // bytes: left → right
+	download int64         // bytes: right → left
+	duration time.Duration
 }
 
 // relay copies data bidirectionally between two connections.
 // When one direction finishes, the other is terminated promptly.
-func relay(left, right net.Conn) {
+// Returns byte counts and duration for diagnostics.
+func relay(left, right net.Conn) relayResult {
+	start := time.Now()
+	var upload, download int64
 	done := make(chan struct{})
 
 	go func() {
 		buf := relayBufPool.Get().([]byte)
-		io.CopyBuffer(right, left, buf)
+		upload, _ = io.CopyBuffer(right, left, buf)
 		relayBufPool.Put(buf)
 		// Signal the other direction to stop
 		if tc, ok := right.(interface{ CloseWrite() error }); ok {
@@ -118,7 +133,7 @@ func relay(left, right net.Conn) {
 	}()
 
 	buf := relayBufPool.Get().([]byte)
-	io.CopyBuffer(left, right, buf)
+	download, _ = io.CopyBuffer(left, right, buf)
 	relayBufPool.Put(buf)
 	if tc, ok := left.(interface{ CloseWrite() error }); ok {
 		tc.CloseWrite()
@@ -127,4 +142,9 @@ func relay(left, right net.Conn) {
 	}
 
 	<-done
+	return relayResult{
+		upload:   upload,
+		download: download,
+		duration: time.Since(start),
+	}
 }

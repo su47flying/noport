@@ -2,7 +2,6 @@ package client
 
 import (
 	"io"
-	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -16,16 +15,14 @@ var relayBufPool = sync.Pool{
 
 // relay copies data bidirectionally between two net.Conn.
 // When one direction finishes, the other is terminated promptly.
-func relay(a, b net.Conn) {
+// Returns bytes transferred in each direction.
+func relay(a, b net.Conn) (aToB int64, bToA int64) {
 	done := make(chan struct{})
 
 	go func() {
 		buf := relayBufPool.Get().([]byte)
-		_, err := io.CopyBuffer(a, b, buf)
+		aToB, _ = io.CopyBuffer(a, b, buf)
 		relayBufPool.Put(buf)
-		if err != nil {
-			slog.Debug("relay copy error", "err", err)
-		}
 		if tc, ok := a.(interface{ CloseWrite() error }); ok {
 			tc.CloseWrite()
 		} else {
@@ -35,11 +32,8 @@ func relay(a, b net.Conn) {
 	}()
 
 	buf := relayBufPool.Get().([]byte)
-	_, err := io.CopyBuffer(b, a, buf)
+	bToA, _ = io.CopyBuffer(b, a, buf)
 	relayBufPool.Put(buf)
-	if err != nil {
-		slog.Debug("relay copy error", "err", err)
-	}
 	if tc, ok := b.(interface{ CloseWrite() error }); ok {
 		tc.CloseWrite()
 	} else {
@@ -47,4 +41,5 @@ func relay(a, b net.Conn) {
 	}
 
 	<-done
+	return
 }

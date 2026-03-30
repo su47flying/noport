@@ -273,5 +273,11 @@ func (c *Client) handleStream(stream *tunnel.MuxStream) {
 	}
 
 	slog.Debug("relaying", "target", target)
-	relay(stream, targetConn)
+	start := time.Now()
+	streamToTarget, targetToStream := relay(stream, targetConn)
+	slog.Info("relay done", "target", target,
+		"duration", time.Since(start).Round(time.Millisecond),
+		"from_server", streamToTarget,
+		"from_target", targetToStream,
+	)
 }
