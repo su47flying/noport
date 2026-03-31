@@ -72,17 +72,28 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 		return
 	}
 
-	// Step 6: Send SOCKS5 success reply immediately (optimistic, no round-trip wait).
-	// Client will dial target and start relay in parallel. If client can't connect,
-	// it closes the stream and the relay terminates — APP sees a broken connection
-	// and retries. This saves one full tunnel round-trip (~200ms), critical for
-	// latency-sensitive connections like YouTube CDN.
+	// Step 6: Wait for client to confirm target connection (1-byte response).
+	// 0x00 = success (client connected to target)
+	// 0x01 = failure (client could not connect to target)
+	var result [1]byte
+	if _, err := io.ReadFull(stream, result[:]); err != nil {
+		slog.Error("failed to read connect result from client", "err", err, "target", target)
+		protocol.WriteSocks5Reply(conn, protocol.RepGeneralFailure, nil, 0)
+		return
+	}
+	if result[0] != 0x00 {
+		slog.Warn("client reported connect failure", "target", target)
+		protocol.WriteSocks5Reply(conn, protocol.RepHostUnreach, nil, 0)
+		return
+	}
+
+	// Step 7: Send SOCKS5 success reply to APP (target is connected)
 	if err := protocol.WriteSocks5Reply(conn, protocol.RepSuccess, net.IPv4zero, 0); err != nil {
 		slog.Error("failed to write socks5 reply", "err", err, "target", target)
 		return
 	}
 
-	// Step 7: Relay data bidirectionally
+	// Step 8: Relay data bidirectionally
 	stats := relay(conn, stream)
 	slog.Info("relay done", "target", target,
 		"duration", stats.duration.Round(time.Millisecond),
@@ -98,37 +109,46 @@ type relayResult struct {
 	duration time.Duration
 }
 
-// relay copies data bidirectionally between two connections.
-// When one direction finishes, the other is terminated promptly.
-// Returns byte counts and duration for diagnostics.
+// relay copies data bidirectionally between two connections (gost transport pattern).
+// Two goroutines copy independently. When the first direction finishes,
+// both connections are closed to unblock the other direction.
+// Caller's deferred Close() calls are safe (idempotent).
 func relay(left, right net.Conn) relayResult {
 	start := time.Now()
 	var upload, download int64
-	done := make(chan struct{})
+	var uploadErr, downloadErr error
 
+	ch := make(chan struct{}, 2)
+
+	// left → right (upload: SOCKS5 conn → mux stream)
 	go func() {
 		buf := relayBufPool.Get().([]byte)
-		upload, _ = io.CopyBuffer(right, left, buf)
+		upload, uploadErr = io.CopyBuffer(right, left, buf)
 		relayBufPool.Put(buf)
-		// Signal the other direction to stop
-		if tc, ok := right.(interface{ CloseWrite() error }); ok {
-			tc.CloseWrite()
-		} else {
-			right.SetReadDeadline(time.Now())
-		}
-		close(done)
+		ch <- struct{}{}
 	}()
 
-	buf := relayBufPool.Get().([]byte)
-	download, _ = io.CopyBuffer(left, right, buf)
-	relayBufPool.Put(buf)
-	if tc, ok := left.(interface{ CloseWrite() error }); ok {
-		tc.CloseWrite()
-	} else {
-		left.SetReadDeadline(time.Now())
+	// right → left (download: mux stream → SOCKS5 conn)
+	go func() {
+		buf := relayBufPool.Get().([]byte)
+		download, downloadErr = io.CopyBuffer(left, right, buf)
+		relayBufPool.Put(buf)
+		ch <- struct{}{}
+	}()
+
+	// Wait for first direction to complete, then close both to unblock the other
+	<-ch
+	left.Close()
+	right.Close()
+	<-ch
+
+	if uploadErr != nil && uploadErr != io.EOF {
+		slog.Debug("relay upload error", "err", uploadErr, "bytes", upload)
+	}
+	if downloadErr != nil && downloadErr != io.EOF {
+		slog.Debug("relay download error", "err", downloadErr, "bytes", download)
 	}
 
-	<-done
 	return relayResult{
 		upload:   upload,
 		download: download,

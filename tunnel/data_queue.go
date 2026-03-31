@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync"
@@ -52,7 +53,10 @@ func (dq *DataQueue) AddConn(conn net.Conn) (*MuxSession, error) {
 		wrapped = dq.cipher.WrapConn(conn)
 	}
 
-	session := NewMuxSession(wrapped, dq.isServer)
+	session, err := NewMuxSession(wrapped, dq.isServer)
+	if err != nil {
+		return nil, fmt.Errorf("create mux session: %w", err)
+	}
 	dq.sessions = append(dq.sessions, session)
 
 	slog.Debug("data queue: added connection", "pool_size", len(dq.sessions))
