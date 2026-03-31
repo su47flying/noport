@@ -257,20 +257,14 @@ func (c *Client) handleStream(stream *tunnel.MuxStream) {
 	}
 	target := string(addrBuf)
 
-	// Dial the actual target and report result back to server
+	// Dial the actual target (optimistic — server already told APP "OK").
+	// APP data is buffered in the smux stream while we dial.
 	targetConn, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
 		slog.Warn("dial target failed", "target", target, "err", err)
-		stream.Write([]byte{0x01}) // report failure to server
-		return
+		return // stream.Close() via defer will notify server
 	}
 	defer targetConn.Close()
-
-	// Report success to server (server waits for this before sending SOCKS5 reply)
-	if _, err := stream.Write([]byte{0x00}); err != nil {
-		slog.Debug("failed to write connect result", "err", err, "target", target)
-		return
-	}
 
 	slog.Debug("relaying", "target", target)
 	start := time.Now()

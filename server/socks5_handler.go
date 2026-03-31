@@ -72,28 +72,16 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 		return
 	}
 
-	// Step 6: Wait for client to confirm target connection (1-byte response).
-	// 0x00 = success (client connected to target)
-	// 0x01 = failure (client could not connect to target)
-	var result [1]byte
-	if _, err := io.ReadFull(stream, result[:]); err != nil {
-		slog.Error("failed to read connect result from client", "err", err, "target", target)
-		protocol.WriteSocks5Reply(conn, protocol.RepGeneralFailure, nil, 0)
-		return
-	}
-	if result[0] != 0x00 {
-		slog.Warn("client reported connect failure", "target", target)
-		protocol.WriteSocks5Reply(conn, protocol.RepHostUnreach, nil, 0)
-		return
-	}
-
-	// Step 7: Send SOCKS5 success reply to APP (target is connected)
+	// Step 6: Send SOCKS5 success reply immediately (optimistic).
+	// Don't wait for client to dial target — APP can start sending data right away.
+	// Data is buffered in the smux stream while client dials. This saves ~400ms
+	// (one full tunnel RTT) which is critical for YouTube CDN connections.
 	if err := protocol.WriteSocks5Reply(conn, protocol.RepSuccess, net.IPv4zero, 0); err != nil {
 		slog.Error("failed to write socks5 reply", "err", err, "target", target)
 		return
 	}
 
-	// Step 8: Relay data bidirectionally
+	// Step 7: Relay data bidirectionally
 	stats := relay(conn, stream)
 	slog.Info("relay done", "target", target,
 		"duration", stats.duration.Round(time.Millisecond),
@@ -109,10 +97,12 @@ type relayResult struct {
 	duration time.Duration
 }
 
-// relay copies data bidirectionally between two connections (gost transport pattern).
+const relayDrainTimeout = 10 * time.Second
+
+// relay copies data bidirectionally between two connections.
 // Two goroutines copy independently. When the first direction finishes,
-// both connections are closed to unblock the other direction.
-// Caller's deferred Close() calls are safe (idempotent).
+// read deadlines are set on both connections to give the other direction
+// time to drain before the caller's deferred Close() cleans up.
 func relay(left, right net.Conn) relayResult {
 	start := time.Now()
 	var upload, download int64
@@ -136,10 +126,10 @@ func relay(left, right net.Conn) relayResult {
 		ch <- struct{}{}
 	}()
 
-	// Wait for first direction to complete, then close both to unblock the other
+	// Wait for first direction to finish; set deadlines to let the other drain
 	<-ch
-	left.Close()
-	right.Close()
+	left.SetReadDeadline(time.Now().Add(relayDrainTimeout))
+	right.SetReadDeadline(time.Now().Add(relayDrainTimeout))
 	<-ch
 
 	if uploadErr != nil && uploadErr != io.EOF {
