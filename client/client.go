@@ -241,9 +241,11 @@ func (c *Client) serveSession(session *tunnel.MuxSession) {
 
 func (c *Client) handleStream(stream *tunnel.MuxStream) {
 	defer stream.Close()
+	start := time.Now()
 
 	// Read 2-byte target address length (big-endian)
 	var addrLen uint16
+	targetReadStart := time.Now()
 	if err := binary.Read(stream, binary.BigEndian, &addrLen); err != nil {
 		slog.Debug("read addr length failed", "err", err)
 		return
@@ -256,25 +258,41 @@ func (c *Client) handleStream(stream *tunnel.MuxStream) {
 		return
 	}
 	target := string(addrBuf)
+	targetReadElapsed := time.Since(targetReadStart)
 
 	// Dial the actual target (no success byte — server already told APP "OK").
 	// Any data APP sends during dial is buffered in MuxStream's bytes.Buffer.
+	dialStart := time.Now()
 	targetConn, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
-		slog.Warn("dial target failed", "target", target, "err", err)
+		slog.Warn("dial target failed", "target", target, "err", err,
+			"target_read", targetReadElapsed.Round(time.Millisecond),
+			"dial_target", time.Since(dialStart).Round(time.Millisecond),
+			"elapsed", time.Since(start).Round(time.Millisecond))
 		return // stream.Close() via defer will notify server
 	}
 	defer targetConn.Close()
+	dialElapsed := time.Since(dialStart)
 
-	slog.Debug("relaying", "target", target)
-	start := time.Now()
+	slog.Debug("client stream ready", "target", target,
+		"target_read", targetReadElapsed.Round(time.Millisecond),
+		"dial_target", dialElapsed.Round(time.Millisecond),
+		"setup_total", time.Since(start).Round(time.Millisecond))
+
 	// relay returns (fromB, fromA) where a=stream, b=targetConn:
 	//   fromB = bytes from targetConn written to stream (target response)
 	//   fromA = bytes from stream written to targetConn (data forwarded to target)
-	fromTarget, toTarget := relay(stream, targetConn)
+	relayStart := time.Now()
+	stats := pkg.Relay(stream, targetConn, &relayBufPool)
 	slog.Info("relay done", "target", target,
-		"duration", time.Since(start).Round(time.Millisecond),
-		"to_target", toTarget,
-		"from_target", fromTarget,
+		"duration", time.Since(relayStart).Round(time.Millisecond),
+		"to_target", stats.AToB.Bytes,
+		"from_target", stats.BToA.Bytes,
+		"to_target_result", stats.AToB.Result,
+		"from_target_result", stats.BToA.Result,
+		"to_target_ttfb", stats.AToB.FirstByte.Round(time.Millisecond),
+		"from_target_ttfb", stats.BToA.FirstByte.Round(time.Millisecond),
+		"to_target_started", stats.AToB.FirstByteSeen,
+		"from_target_started", stats.BToA.FirstByteSeen,
 	)
 }

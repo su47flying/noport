@@ -23,14 +23,19 @@ const forwarderDialTimeout = 10 * time.Second
 // Forwarder listens on -L endpoints and forwards traffic through -F upstream SOCKS5 proxy.
 // No tunnel/admin/mux needed — direct TCP forwarding.
 type Forwarder struct {
-	cfg *pkg.Config
-	ctx context.Context
+	cfg    *pkg.Config
+	ctx    context.Context
 	cancel context.CancelFunc
-	wg  sync.WaitGroup
+	wg     sync.WaitGroup
 
 	upstreamAddr string
 	upstreamUser string
 	upstreamPass string
+}
+
+type upstreamDialStats struct {
+	TCPDial time.Duration
+	Socks5  time.Duration
 }
 
 func NewForwarder(cfg *pkg.Config) (*Forwarder, error) {
@@ -165,32 +170,62 @@ func (f *Forwarder) listenHTTP(addr string) error {
 // handleSocks5 handles a SOCKS5 client: auth → read CONNECT → dial upstream → SOCKS5 dial → relay.
 func (f *Forwarder) handleSocks5(conn net.Conn, user, pass string) {
 	defer conn.Close()
+	start := time.Now()
 
 	conn.SetDeadline(time.Now().Add(socks5HandshakeTimeout))
+	handshakeStart := time.Now()
 	if err := protocol.HandleSocks5Handshake(conn, user, pass); err != nil {
-		slog.Debug("forwarder socks5 handshake failed", "err", err)
+		slog.Debug("forwarder socks5 handshake failed", "err", err,
+			"elapsed", time.Since(start).Round(time.Millisecond))
 		return
 	}
+	handshakeElapsed := time.Since(handshakeStart)
 
+	requestStart := time.Now()
 	req, err := protocol.ReadSocks5Request(conn)
 	if err != nil {
 		protocol.WriteSocks5Reply(conn, protocol.RepCmdNotSupported, nil, 0)
 		return
 	}
+	requestElapsed := time.Since(requestStart)
 	conn.SetDeadline(time.Time{})
 
 	target := req.Target()
 	slog.Debug("forwarder socks5 connect", "target", target)
 
-	upstream, err := f.dialUpstream(target)
+	upstream, dialStats, err := f.dialUpstream(target)
 	if err != nil {
-		slog.Warn("forwarder upstream dial failed", "target", target, "err", err)
+		slog.Warn("forwarder upstream dial failed", "target", target, "err", err,
+			"handshake", handshakeElapsed.Round(time.Millisecond),
+			"request_read", requestElapsed.Round(time.Millisecond),
+			"upstream_tcp_dial", dialStats.TCPDial.Round(time.Millisecond),
+			"upstream_socks5", dialStats.Socks5.Round(time.Millisecond),
+			"elapsed", time.Since(start).Round(time.Millisecond))
 		protocol.WriteSocks5Reply(conn, protocol.RepHostUnreach, nil, 0)
 		return
 	}
 	defer upstream.Close()
 
-	protocol.WriteSocks5Reply(conn, protocol.RepSuccess, net.IPv4zero, 0)
+	replyStart := time.Now()
+	if err := protocol.WriteSocks5Reply(conn, protocol.RepSuccess, net.IPv4zero, 0); err != nil {
+		slog.Warn("forwarder write socks5 reply failed", "target", target, "err", err,
+			"handshake", handshakeElapsed.Round(time.Millisecond),
+			"request_read", requestElapsed.Round(time.Millisecond),
+			"upstream_tcp_dial", dialStats.TCPDial.Round(time.Millisecond),
+			"upstream_socks5", dialStats.Socks5.Round(time.Millisecond),
+			"reply_write", time.Since(replyStart).Round(time.Millisecond),
+			"elapsed", time.Since(start).Round(time.Millisecond))
+		return
+	}
+	replyElapsed := time.Since(replyStart)
+
+	slog.Debug("forwarder socks5 pipeline ready", "target", target,
+		"handshake", handshakeElapsed.Round(time.Millisecond),
+		"request_read", requestElapsed.Round(time.Millisecond),
+		"upstream_tcp_dial", dialStats.TCPDial.Round(time.Millisecond),
+		"upstream_socks5", dialStats.Socks5.Round(time.Millisecond),
+		"reply_write", replyElapsed.Round(time.Millisecond),
+		"setup_total", time.Since(start).Round(time.Millisecond))
 
 	f.relay(conn, upstream, target)
 }
@@ -198,93 +233,112 @@ func (f *Forwarder) handleSocks5(conn net.Conn, user, pass string) {
 // handleHTTP handles an HTTP proxy client: parse request → dial upstream → relay.
 func (f *Forwarder) handleHTTP(conn net.Conn) {
 	defer conn.Close()
+	start := time.Now()
 
 	conn.SetDeadline(time.Now().Add(httpHandshakeTimeout))
 	br := bufio.NewReader(conn)
+	parseStart := time.Now()
 	req, err := protocol.ReadHTTPRequest(br)
 	if err != nil {
-		slog.Debug("forwarder http read failed", "err", err)
+		slog.Debug("forwarder http read failed", "err", err,
+			"elapsed", time.Since(start).Round(time.Millisecond))
 		return
 	}
+	parseElapsed := time.Since(parseStart)
 	conn.SetDeadline(time.Time{})
 
 	target := protocol.HTTPTargetFromRequest(req)
-	slog.Debug("forwarder http request", "method", req.Method, "target", target)
+	slog.Debug("forwarder http request", "method", req.Method, "target", target,
+		"request_parse", parseElapsed.Round(time.Millisecond))
 
-	upstream, err := f.dialUpstream(target)
+	upstream, dialStats, err := f.dialUpstream(target)
 	if err != nil {
-		slog.Warn("forwarder upstream dial failed", "target", target, "err", err)
+		slog.Warn("forwarder upstream dial failed", "target", target, "err", err,
+			"request_parse", parseElapsed.Round(time.Millisecond),
+			"upstream_tcp_dial", dialStats.TCPDial.Round(time.Millisecond),
+			"upstream_socks5", dialStats.Socks5.Round(time.Millisecond),
+			"elapsed", time.Since(start).Round(time.Millisecond))
 		protocol.WriteHTTPError(conn, 502, "upstream unavailable")
 		return
 	}
 	defer upstream.Close()
 
 	if req.Method == http.MethodConnect {
-		protocol.WriteHTTPConnectOK(conn)
+		replyStart := time.Now()
+		if err := protocol.WriteHTTPConnectOK(conn); err != nil {
+			slog.Warn("forwarder write connect ok failed", "target", target, "err", err,
+				"request_parse", parseElapsed.Round(time.Millisecond),
+				"upstream_tcp_dial", dialStats.TCPDial.Round(time.Millisecond),
+				"upstream_socks5", dialStats.Socks5.Round(time.Millisecond),
+				"response_write", time.Since(replyStart).Round(time.Millisecond),
+				"elapsed", time.Since(start).Round(time.Millisecond))
+			return
+		}
+		slog.Debug("forwarder http connect pipeline ready", "target", target,
+			"request_parse", parseElapsed.Round(time.Millisecond),
+			"upstream_tcp_dial", dialStats.TCPDial.Round(time.Millisecond),
+			"upstream_socks5", dialStats.Socks5.Round(time.Millisecond),
+			"response_write", time.Since(replyStart).Round(time.Millisecond),
+			"setup_total", time.Since(start).Round(time.Millisecond))
 	} else {
 		// Forward the original request through upstream
+		requestForwardStart := time.Now()
 		reqBytes := protocol.RewriteHTTPRequestToRelative(req)
 		if _, err := upstream.Write(reqBytes); err != nil {
 			slog.Warn("forwarder write request failed", "err", err)
 			return
 		}
 		if req.Body != nil {
-			io.Copy(upstream, req.Body)
+			_, _ = io.Copy(upstream, req.Body)
 			req.Body.Close()
 		}
 		if br.Buffered() > 0 {
 			peek, _ := br.Peek(br.Buffered())
-			upstream.Write(peek)
+			_, _ = upstream.Write(peek)
 		}
+		slog.Debug("forwarder http plain pipeline ready", "target", target,
+			"method", req.Method,
+			"request_parse", parseElapsed.Round(time.Millisecond),
+			"upstream_tcp_dial", dialStats.TCPDial.Round(time.Millisecond),
+			"upstream_socks5", dialStats.Socks5.Round(time.Millisecond),
+			"request_forward", time.Since(requestForwardStart).Round(time.Millisecond),
+			"setup_total", time.Since(start).Round(time.Millisecond))
 	}
 
 	f.relay(conn, upstream, target)
 }
 
 // dialUpstream connects to the -F upstream SOCKS5 proxy and issues a CONNECT for the target.
-func (f *Forwarder) dialUpstream(target string) (net.Conn, error) {
+func (f *Forwarder) dialUpstream(target string) (net.Conn, upstreamDialStats, error) {
+	var stats upstreamDialStats
+	dialStart := time.Now()
 	conn, err := net.DialTimeout("tcp", f.upstreamAddr, forwarderDialTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("dial upstream %s: %w", f.upstreamAddr, err)
+		stats.TCPDial = time.Since(dialStart)
+		return nil, stats, fmt.Errorf("dial upstream %s: %w", f.upstreamAddr, err)
 	}
+	stats.TCPDial = time.Since(dialStart)
 
+	socksStart := time.Now()
 	if err := protocol.Socks5Dial(conn, target, f.upstreamUser, f.upstreamPass); err != nil {
+		stats.Socks5 = time.Since(socksStart)
 		conn.Close()
-		return nil, fmt.Errorf("socks5 dial upstream: %w", err)
+		return nil, stats, fmt.Errorf("socks5 dial upstream: %w", err)
 	}
+	stats.Socks5 = time.Since(socksStart)
 
-	return conn, nil
+	return conn, stats, nil
 }
 
 // relay copies bidirectionally between two connections (forwarder version).
 func (f *Forwarder) relay(left, right net.Conn, target string) {
-	start := time.Now()
-	var upload, download int64
-	done := make(chan struct{})
-
-	go func() {
-		buf := relayBufPool.Get().([]byte)
-		upload, _ = io.CopyBuffer(right, left, buf)
-		relayBufPool.Put(buf)
-		if tc, ok := right.(interface{ CloseWrite() error }); ok {
-			tc.CloseWrite()
-		} else {
-			right.SetReadDeadline(time.Now())
-		}
-		close(done)
-	}()
-
-	buf := relayBufPool.Get().([]byte)
-	download, _ = io.CopyBuffer(left, right, buf)
-	relayBufPool.Put(buf)
-	if tc, ok := left.(interface{ CloseWrite() error }); ok {
-		tc.CloseWrite()
-	} else {
-		left.SetReadDeadline(time.Now())
-	}
-
-	<-done
+	stats := pkg.Relay(left, right, &relayBufPool)
 	slog.Info("forwarder relay done", "target", target,
-		"duration", time.Since(start).Round(time.Millisecond),
-		"upload", upload, "download", download)
+		"duration", stats.Duration.Round(time.Millisecond),
+		"upload", stats.AToB.Bytes, "download", stats.BToA.Bytes,
+		"upload_result", stats.AToB.Result, "download_result", stats.BToA.Result,
+		"upload_ttfb", stats.AToB.FirstByte.Round(time.Millisecond),
+		"download_ttfb", stats.BToA.FirstByte.Round(time.Millisecond),
+		"upload_started", stats.AToB.FirstByteSeen,
+		"download_started", stats.BToA.FirstByteSeen)
 }
