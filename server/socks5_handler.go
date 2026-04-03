@@ -27,7 +27,7 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 
 	// Step 1: SOCKS5 handshake (with timeout)
 	conn.SetDeadline(time.Now().Add(socks5HandshakeTimeout))
-	if err := protocol.HandleSocks5Handshake(conn); err != nil {
+	if err := protocol.HandleSocks5Handshake(conn, s.socks5User, s.socks5Pass); err != nil {
 		slog.Debug("socks5 handshake failed", "remote", remote, "err", err)
 		return
 	}

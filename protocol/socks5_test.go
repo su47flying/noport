@@ -13,7 +13,7 @@ func TestHandshakeSuccess(t *testing.T) {
 	buf := &bytes.Buffer{}
 	buf.Write(input)
 
-	if err := HandleSocks5Handshake(buf); err != nil {
+	if err := HandleSocks5Handshake(buf, "", ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -28,19 +28,19 @@ func TestHandshakeWrongVersion(t *testing.T) {
 	buf := &bytes.Buffer{}
 	buf.Write(input)
 
-	err := HandleSocks5Handshake(buf)
+	err := HandleSocks5Handshake(buf, "", "")
 	if err == nil {
 		t.Fatal("expected error for wrong version")
 	}
 }
 
 func TestHandshakeNoAcceptableAuth(t *testing.T) {
-	// Client only offers method 0x02 (username/password), not 0x00.
+	// Client only offers method 0x02 (username/password), no-auth server rejects.
 	input := []byte{0x05, 0x01, 0x02}
 	buf := &bytes.Buffer{}
 	buf.Write(input)
 
-	err := HandleSocks5Handshake(buf)
+	err := HandleSocks5Handshake(buf, "", "")
 	if err == nil {
 		t.Fatal("expected error for no acceptable auth")
 	}
@@ -173,5 +173,76 @@ func TestWriteReplyNilAddr(t *testing.T) {
 	ip := net.IP(data[4:8])
 	if !ip.Equal(net.IPv4zero.To4()) {
 		t.Fatalf("expected 0.0.0.0, got %s", ip)
+	}
+}
+
+func TestHandshakeUserPassSuccess(t *testing.T) {
+	// Client offers user/pass method
+	var buf bytes.Buffer
+	buf.Write([]byte{0x05, 0x01, AuthUserPass})
+	// RFC 1929: [ver=1, ulen=4, user, plen=6, pass]
+	user := "test"
+	pass := "secret"
+	buf.WriteByte(AuthUserPassVersion)
+	buf.WriteByte(byte(len(user)))
+	buf.WriteString(user)
+	buf.WriteByte(byte(len(pass)))
+	buf.WriteString(pass)
+
+	err := HandleSocks5Handshake(&buf, "test", "secret")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resp := buf.Bytes()
+	// Should have: [05, 02] (method selection) + [01, 00] (auth success)
+	if len(resp) != 4 {
+		t.Fatalf("expected 4 bytes, got %d: %x", len(resp), resp)
+	}
+	if resp[0] != 0x05 || resp[1] != AuthUserPass {
+		t.Fatalf("expected method 0x02, got: %x", resp[:2])
+	}
+	if resp[2] != AuthUserPassVersion || resp[3] != AuthSuccess {
+		t.Fatalf("expected auth success, got: %x", resp[2:])
+	}
+}
+
+func TestHandshakeUserPassBadCreds(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write([]byte{0x05, 0x01, AuthUserPass})
+	buf.WriteByte(AuthUserPassVersion)
+	buf.WriteByte(4)
+	buf.WriteString("test")
+	buf.WriteByte(5)
+	buf.WriteString("wrong")
+
+	err := HandleSocks5Handshake(&buf, "test", "secret")
+	if err == nil {
+		t.Fatal("expected error for bad credentials")
+	}
+
+	resp := buf.Bytes()
+	// [05, 02] method + [01, 01] auth failure
+	if len(resp) != 4 {
+		t.Fatalf("expected 4 bytes, got %d: %x", len(resp), resp)
+	}
+	if resp[3] != AuthFailure {
+		t.Fatalf("expected auth failure, got 0x%02x", resp[3])
+	}
+}
+
+func TestHandshakeUserPassClientNoMethod(t *testing.T) {
+	// Server requires auth but client only offers no-auth
+	var buf bytes.Buffer
+	buf.Write([]byte{0x05, 0x01, AuthNone})
+
+	err := HandleSocks5Handshake(&buf, "test", "secret")
+	if err == nil {
+		t.Fatal("expected error when client doesn't support user/pass")
+	}
+
+	resp := buf.Bytes()
+	if resp[1] != AuthReject {
+		t.Fatalf("expected reject, got 0x%02x", resp[1])
 	}
 }

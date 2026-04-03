@@ -29,9 +29,12 @@ type Server struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 
-	adminAddr string
-	dataAddr  string
+	adminAddr  string
+	dataAddr   string
 	socks5Addr string
+	socks5User string
+	socks5Pass string
+	httpAddr   string
 }
 
 func New(cfg *pkg.Config) (*Server, error) {
@@ -54,9 +57,11 @@ func New(cfg *pkg.Config) (*Server, error) {
 		return nil, fmt.Errorf("no data endpoint in -R flags")
 	}
 
-	socks5Ep, ok := pkg.GetEndpoint(cfg.Listens, "socks5")
-	if !ok {
-		return nil, fmt.Errorf("no socks5 endpoint in -L flags")
+	socks5Ep, hasSocks5 := pkg.GetEndpoint(cfg.Listens, "socks5")
+	httpEp, hasHTTP := pkg.GetEndpoint(cfg.Listens, "http")
+
+	if !hasSocks5 && !hasHTTP {
+		return nil, fmt.Errorf("no socks5 or http endpoint in -L flags")
 	}
 
 	key := []byte(cfg.Key)
@@ -71,16 +76,26 @@ func New(cfg *pkg.Config) (*Server, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &Server{
-		cfg:        cfg,
-		cipher:     cipher,
-		dataQueue:  tunnel.NewDataQueue(cipher, true),
-		ctx:        ctx,
-		cancel:     cancel,
-		adminAddr:  fmt.Sprintf("%s:%d", adminEp.Host, adminEp.Port),
-		dataAddr:   fmt.Sprintf("%s:%d", dataEp.Host, dataEp.Port),
-		socks5Addr: fmt.Sprintf("%s:%d", socks5Ep.Host, socks5Ep.Port),
-	}, nil
+	srv := &Server{
+		cfg:       cfg,
+		cipher:    cipher,
+		dataQueue: tunnel.NewDataQueue(cipher, true),
+		ctx:       ctx,
+		cancel:    cancel,
+		adminAddr: fmt.Sprintf("%s:%d", adminEp.Host, adminEp.Port),
+		dataAddr:  fmt.Sprintf("%s:%d", dataEp.Host, dataEp.Port),
+	}
+
+	if hasSocks5 {
+		srv.socks5Addr = fmt.Sprintf("%s:%d", socks5Ep.Host, socks5Ep.Port)
+		srv.socks5User = socks5Ep.User
+		srv.socks5Pass = socks5Ep.Pass
+	}
+	if hasHTTP {
+		srv.httpAddr = fmt.Sprintf("%s:%d", httpEp.Host, httpEp.Port)
+	}
+
+	return srv, nil
 }
 
 func (s *Server) Run() error {
@@ -88,12 +103,22 @@ func (s *Server) Run() error {
 		"admin", s.adminAddr,
 		"data", s.dataAddr,
 		"socks5", s.socks5Addr,
+		"http", s.httpAddr,
 		"cipher", s.cipher.Name(),
 	)
 
-	errCh := make(chan error, 3)
+	// Count listeners: admin + data + optional socks5 + optional http
+	numListeners := 2
+	if s.socks5Addr != "" {
+		numListeners++
+	}
+	if s.httpAddr != "" {
+		numListeners++
+	}
 
-	s.wg.Add(3)
+	errCh := make(chan error, numListeners)
+
+	s.wg.Add(numListeners)
 	go func() {
 		defer s.wg.Done()
 		if err := s.listenAdmin(s.adminAddr); err != nil {
@@ -108,13 +133,24 @@ func (s *Server) Run() error {
 			errCh <- err
 		}
 	}()
-	go func() {
-		defer s.wg.Done()
-		if err := s.listenSocks5(s.socks5Addr); err != nil {
-			slog.Error("socks5 listener error", "err", err)
-			errCh <- err
-		}
-	}()
+	if s.socks5Addr != "" {
+		go func() {
+			defer s.wg.Done()
+			if err := s.listenSocks5(s.socks5Addr); err != nil {
+				slog.Error("socks5 listener error", "err", err)
+				errCh <- err
+			}
+		}()
+	}
+	if s.httpAddr != "" {
+		go func() {
+			defer s.wg.Done()
+			if err := s.listenHTTP(s.httpAddr); err != nil {
+				slog.Error("http listener error", "err", err)
+				errCh <- err
+			}
+		}()
+	}
 
 	// Wait for shutdown signal or fatal error
 	sigCh := make(chan os.Signal, 1)
@@ -251,6 +287,37 @@ func (s *Server) listenSocks5(addr string) error {
 
 		slog.Debug("socks5 connection accepted", "remote", conn.RemoteAddr())
 		go s.handleSocks5Conn(conn)
+	}
+}
+
+func (s *Server) listenHTTP(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("http listen: %w", err)
+	}
+	defer ln.Close()
+
+	slog.Info("http proxy listener started", "addr", addr)
+
+	go func() {
+		<-s.ctx.Done()
+		ln.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-s.ctx.Done():
+				return nil
+			default:
+				slog.Warn("http accept error", "err", err)
+				continue
+			}
+		}
+
+		slog.Debug("http connection accepted", "remote", conn.RemoteAddr())
+		go s.handleHTTPConn(conn)
 	}
 }
 

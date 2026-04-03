@@ -4,15 +4,18 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 )
 
 // Endpoint represents a parsed URL-scheme endpoint.
 type Endpoint struct {
-	Scheme string // "xor", "chacha20", "admin", "socks5"
+	Scheme string // "xor", "chacha20", "admin", "socks5", "http"
 	Host   string // hostname or empty
 	Port   int    // port number
+	User   string // optional username (for socks5 auth or -F upstream)
+	Pass   string // optional password
 	Raw    string // original string
 }
 
@@ -21,6 +24,7 @@ type Config struct {
 	Connects []Endpoint // -C flags (client mode)
 	Listens  []Endpoint // -L flags (server mode)
 	Remotes  []Endpoint // -R flags (server mode)
+	Forwards []Endpoint // -F flags (forwarder mode)
 	Key      string     // -key encryption key
 	Debug    bool       // -debug flag
 }
@@ -30,9 +34,14 @@ func (c *Config) IsClient() bool {
 	return len(c.Connects) > 0
 }
 
-// IsServer returns true if running in server mode (has -L or -R flags).
+// IsForwarder returns true if running in forwarder mode (has -L and -F, no -C/-R).
+func (c *Config) IsForwarder() bool {
+	return len(c.Forwards) > 0 && len(c.Listens) > 0
+}
+
+// IsServer returns true if running in server mode (has -L and -R flags, not forwarder).
 func (c *Config) IsServer() bool {
-	return len(c.Listens) > 0 || len(c.Remotes) > 0
+	return len(c.Remotes) > 0 && len(c.Listens) > 0
 }
 
 // GetEndpoint finds the first endpoint with the given scheme from a slice.
@@ -57,26 +66,27 @@ func (s *stringSlice) Set(value string) error {
 	return nil
 }
 
-// parseEndpoint parses a "scheme://host:port" string into an Endpoint.
+// parseEndpoint parses a "scheme://[user:pass@]host:port" string into an Endpoint.
 func parseEndpoint(raw string) (Endpoint, error) {
-	// Split on "://"
-	parts := strings.SplitN(raw, "://", 2)
-	if len(parts) != 2 {
+	// Ensure scheme separator exists
+	if !strings.Contains(raw, "://") {
 		return Endpoint{}, fmt.Errorf("invalid endpoint format %q: expected scheme://host:port", raw)
 	}
 
-	scheme := strings.ToLower(parts[0])
-	hostPort := parts[1]
+	u, err := url.Parse(raw)
+	if err != nil {
+		return Endpoint{}, fmt.Errorf("invalid endpoint %q: %w", raw, err)
+	}
 
-	// Normalize scheme: known schemes pass through, unknown defaults to chacha20
+	scheme := strings.ToLower(u.Scheme)
 	switch scheme {
-	case "admin", "socks5", "xor", "chacha20":
+	case "admin", "socks5", "xor", "chacha20", "http":
 		// keep as-is
 	default:
 		scheme = "chacha20"
 	}
 
-	host, portStr, err := net.SplitHostPort(hostPort)
+	host, portStr, err := net.SplitHostPort(u.Host)
 	if err != nil {
 		return Endpoint{}, fmt.Errorf("invalid endpoint %q: %w", raw, err)
 	}
@@ -86,12 +96,19 @@ func parseEndpoint(raw string) (Endpoint, error) {
 		return Endpoint{}, fmt.Errorf("invalid port in %q: %w", raw, err)
 	}
 
-	return Endpoint{
+	ep := Endpoint{
 		Scheme: scheme,
 		Host:   host,
 		Port:   port,
 		Raw:    raw,
-	}, nil
+	}
+
+	if u.User != nil {
+		ep.User = u.User.Username()
+		ep.Pass, _ = u.User.Password()
+	}
+
+	return ep, nil
 }
 
 // parseEndpoints converts a slice of raw strings into Endpoints.
@@ -111,9 +128,12 @@ func parseEndpoints(raws []string) ([]Endpoint, error) {
 func ParseConfig() (*Config, error) {
 	var connects, listens, remotes stringSlice
 
+	var forwards stringSlice
+
 	flag.Var(&connects, "C", "Client connect endpoint (scheme://host:port), may be repeated")
-	flag.Var(&listens, "L", "Server listen endpoint (scheme://host:port), may be repeated")
+	flag.Var(&listens, "L", "Listen endpoint (scheme://[user:pass@]host:port), may be repeated")
 	flag.Var(&remotes, "R", "Server remote endpoint (scheme://host:port), may be repeated")
+	flag.Var(&forwards, "F", "Forward upstream (scheme://[user:pass@]host:port), may be repeated")
 
 	key := flag.String("key", "", "Encryption key")
 	debug := flag.Bool("debug", false, "Enable debug logging")
@@ -136,6 +156,9 @@ func ParseConfig() (*Config, error) {
 	if cfg.Remotes, err = parseEndpoints(remotes); err != nil {
 		return nil, fmt.Errorf("parsing -R: %w", err)
 	}
+	if cfg.Forwards, err = parseEndpoints(forwards); err != nil {
+		return nil, fmt.Errorf("parsing -F: %w", err)
+	}
 
 	// Validate: client mode must have an admin endpoint in -C
 	if cfg.IsClient() {
@@ -144,8 +167,8 @@ func ParseConfig() (*Config, error) {
 		}
 	}
 
-	// Validate: server mode must have an admin endpoint in -R
-	if cfg.IsServer() {
+	// Validate: server mode (non-forwarder) must have an admin endpoint in -R
+	if cfg.IsServer() && !cfg.IsForwarder() {
 		if _, ok := GetEndpoint(cfg.Remotes, "admin"); !ok {
 			return nil, fmt.Errorf("server mode requires an admin endpoint in -R flags")
 		}

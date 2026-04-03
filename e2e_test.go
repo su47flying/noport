@@ -172,6 +172,305 @@ func testE2EWithCipher(t *testing.T, cipherName string) {
 	t.Logf("E2E test passed with cipher %s", cipherName)
 }
 
+// TestE2ESocks5Auth tests SOCKS5 with username/password authentication.
+func TestE2ESocks5Auth(t *testing.T) {
+	pkg.InitLogger(true)
+
+	targetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "auth-ok")
+	}))
+	defer targetSrv.Close()
+
+	adminPort := getFreePort(t)
+	dataPort := getFreePort(t)
+	socks5Port := getFreePort(t)
+
+	serverCfg := &pkg.Config{
+		Listens: []pkg.Endpoint{
+			{Scheme: "socks5", Host: "", Port: socks5Port, User: "myuser", Pass: "mypass"},
+		},
+		Remotes: []pkg.Endpoint{
+			{Scheme: "admin", Host: "", Port: adminPort},
+			{Scheme: "xor", Host: "", Port: dataPort},
+		},
+		Key:   "test-key",
+		Debug: true,
+	}
+
+	srv, err := server.New(serverCfg)
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- srv.Run() }()
+	defer func() { srv.Shutdown(); <-srvDone }()
+	time.Sleep(300 * time.Millisecond)
+
+	clientCfg := &pkg.Config{
+		Connects: []pkg.Endpoint{
+			{Scheme: "xor", Host: "127.0.0.1", Port: dataPort},
+			{Scheme: "admin", Host: "127.0.0.1", Port: adminPort},
+		},
+		Key:   "test-key",
+		Debug: true,
+	}
+	cli, err := client.New(clientCfg)
+	if err != nil {
+		t.Fatalf("client.New: %v", err)
+	}
+	cliDone := make(chan error, 1)
+	go func() { cliDone <- cli.Run() }()
+	defer func() { cli.Shutdown(); <-cliDone }()
+	time.Sleep(1 * time.Second)
+
+	// Test with CORRECT credentials
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", socks5Port), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// Offer user/pass auth
+	conn.Write([]byte{0x05, 0x01, 0x02})
+	resp := make([]byte, 2)
+	io.ReadFull(conn, resp)
+	if resp[1] != 0x02 {
+		t.Fatalf("expected method 0x02, got 0x%02x", resp[1])
+	}
+
+	// Send credentials
+	auth := []byte{0x01, 6}
+	auth = append(auth, []byte("myuser")...)
+	auth = append(auth, 6)
+	auth = append(auth, []byte("mypass")...)
+	conn.Write(auth)
+
+	authResp := make([]byte, 2)
+	io.ReadFull(conn, authResp)
+	if authResp[1] != 0x00 {
+		t.Fatalf("auth failed: %x", authResp)
+	}
+
+	// CONNECT
+	targetHost, targetPort := parseHostPort(t, targetSrv.URL)
+	conn.Write(buildSocks5ConnectRequest(targetHost, targetPort))
+	connResp := make([]byte, 10)
+	io.ReadFull(conn, connResp)
+	if connResp[1] != 0x00 {
+		t.Fatalf("connect failed: %d", connResp[1])
+	}
+
+	// HTTP through tunnel
+	fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n", targetHost, targetPort)
+	httpResp, _ := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "GET"})
+	body, _ := io.ReadAll(httpResp.Body)
+	httpResp.Body.Close()
+	if string(body) != "auth-ok" {
+		t.Fatalf("unexpected body: %s", string(body))
+	}
+
+	// Test with WRONG credentials — should fail
+	conn2, _ := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", socks5Port), 5*time.Second)
+	defer conn2.Close()
+	conn2.SetDeadline(time.Now().Add(5 * time.Second))
+	conn2.Write([]byte{0x05, 0x01, 0x02})
+	io.ReadFull(conn2, resp)
+
+	badAuth := []byte{0x01, 6}
+	badAuth = append(badAuth, []byte("myuser")...)
+	badAuth = append(badAuth, 3)
+	badAuth = append(badAuth, []byte("bad")...)
+	conn2.Write(badAuth)
+	io.ReadFull(conn2, authResp)
+	if authResp[1] != 0x01 {
+		t.Fatalf("expected auth failure, got 0x%02x", authResp[1])
+	}
+
+	t.Log("SOCKS5 auth E2E passed")
+}
+
+// TestE2EHTTPProxy tests the HTTP CONNECT proxy through the tunnel.
+func TestE2EHTTPProxy(t *testing.T) {
+	pkg.InitLogger(true)
+
+	targetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "http-proxy-ok")
+	}))
+	defer targetSrv.Close()
+
+	adminPort := getFreePort(t)
+	dataPort := getFreePort(t)
+	httpPort := getFreePort(t)
+
+	serverCfg := &pkg.Config{
+		Listens: []pkg.Endpoint{
+			{Scheme: "http", Host: "", Port: httpPort},
+		},
+		Remotes: []pkg.Endpoint{
+			{Scheme: "admin", Host: "", Port: adminPort},
+			{Scheme: "xor", Host: "", Port: dataPort},
+		},
+		Key:   "test-key",
+		Debug: true,
+	}
+
+	srv, err := server.New(serverCfg)
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- srv.Run() }()
+	defer func() { srv.Shutdown(); <-srvDone }()
+	time.Sleep(300 * time.Millisecond)
+
+	clientCfg := &pkg.Config{
+		Connects: []pkg.Endpoint{
+			{Scheme: "xor", Host: "127.0.0.1", Port: dataPort},
+			{Scheme: "admin", Host: "127.0.0.1", Port: adminPort},
+		},
+		Key:   "test-key",
+		Debug: true,
+	}
+	cli, err := client.New(clientCfg)
+	if err != nil {
+		t.Fatalf("client.New: %v", err)
+	}
+	cliDone := make(chan error, 1)
+	go func() { cliDone <- cli.Run() }()
+	defer func() { cli.Shutdown(); <-cliDone }()
+	time.Sleep(1 * time.Second)
+
+	// Use HTTP CONNECT through the proxy
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", httpPort))
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := httpClient.Get(targetSrv.URL)
+	if err != nil {
+		t.Fatalf("http get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "http-proxy-ok" {
+		t.Fatalf("unexpected body: %s", string(body))
+	}
+	t.Log("HTTP proxy E2E passed")
+}
+
+// TestE2EForwarder tests the forwarder chain:
+// client → forwarder SOCKS5 → upstream SOCKS5 (server+tunnel) → target
+func TestE2EForwarder(t *testing.T) {
+	pkg.InitLogger(true)
+
+	targetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "forwarder-ok")
+	}))
+	defer targetSrv.Close()
+
+	// Start a full server+client tunnel as the upstream
+	adminPort := getFreePort(t)
+	dataPort := getFreePort(t)
+	upstreamSocks5Port := getFreePort(t)
+
+	serverCfg := &pkg.Config{
+		Listens: []pkg.Endpoint{
+			{Scheme: "socks5", Host: "", Port: upstreamSocks5Port},
+		},
+		Remotes: []pkg.Endpoint{
+			{Scheme: "admin", Host: "", Port: adminPort},
+			{Scheme: "xor", Host: "", Port: dataPort},
+		},
+		Key:   "test-key",
+		Debug: true,
+	}
+	srv, err := server.New(serverCfg)
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- srv.Run() }()
+	defer func() { srv.Shutdown(); <-srvDone }()
+	time.Sleep(300 * time.Millisecond)
+
+	clientCfg := &pkg.Config{
+		Connects: []pkg.Endpoint{
+			{Scheme: "xor", Host: "127.0.0.1", Port: dataPort},
+			{Scheme: "admin", Host: "127.0.0.1", Port: adminPort},
+		},
+		Key:   "test-key",
+		Debug: true,
+	}
+	cli, err := client.New(clientCfg)
+	if err != nil {
+		t.Fatalf("client.New: %v", err)
+	}
+	cliDone := make(chan error, 1)
+	go func() { cliDone <- cli.Run() }()
+	defer func() { cli.Shutdown(); <-cliDone }()
+	time.Sleep(1 * time.Second)
+
+	// Start forwarder: -L socks5://:localPort -F socks5://127.0.0.1:upstreamPort
+	fwdPort := getFreePort(t)
+	fwdCfg := &pkg.Config{
+		Listens: []pkg.Endpoint{
+			{Scheme: "socks5", Host: "", Port: fwdPort},
+		},
+		Forwards: []pkg.Endpoint{
+			{Scheme: "socks5", Host: "127.0.0.1", Port: upstreamSocks5Port},
+		},
+		Debug: true,
+	}
+	fwd, err := server.NewForwarder(fwdCfg)
+	if err != nil {
+		t.Fatalf("NewForwarder: %v", err)
+	}
+	fwdDone := make(chan error, 1)
+	go func() { fwdDone <- fwd.Run() }()
+	defer func() { fwd.Shutdown(); <-fwdDone }()
+	time.Sleep(300 * time.Millisecond)
+
+	// Connect through the forwarder
+	proxyConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", fwdPort), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial forwarder: %v", err)
+	}
+	defer proxyConn.Close()
+	proxyConn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// SOCKS5 handshake with forwarder
+	proxyConn.Write([]byte{0x05, 0x01, 0x00})
+	hsResp := make([]byte, 2)
+	io.ReadFull(proxyConn, hsResp)
+	if hsResp[1] != 0x00 {
+		t.Fatalf("handshake: %x", hsResp)
+	}
+
+	targetHost, targetPort := parseHostPort(t, targetSrv.URL)
+	proxyConn.Write(buildSocks5ConnectRequest(targetHost, targetPort))
+	connResp := make([]byte, 10)
+	io.ReadFull(proxyConn, connResp)
+	if connResp[1] != 0x00 {
+		t.Fatalf("connect failed: %d", connResp[1])
+	}
+
+	fmt.Fprintf(proxyConn, "GET / HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n", targetHost, targetPort)
+	httpResp, err := http.ReadResponse(bufio.NewReader(proxyConn), &http.Request{Method: "GET"})
+	if err != nil {
+		t.Fatalf("http read: %v", err)
+	}
+	body, _ := io.ReadAll(httpResp.Body)
+	httpResp.Body.Close()
+	if string(body) != "forwarder-ok" {
+		t.Fatalf("unexpected body: %s", string(body))
+	}
+	t.Log("Forwarder E2E passed")
+}
+
 func getFreePort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

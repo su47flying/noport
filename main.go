@@ -37,13 +37,18 @@ func main() {
 			slog.Error("client error", "err", err)
 			os.Exit(1)
 		}
+	} else if cfg.IsForwarder() {
+		if err := cmd.RunForwarder(cfg); err != nil {
+			slog.Error("forwarder error", "err", err)
+			os.Exit(1)
+		}
 	} else if cfg.IsServer() {
 		if err := cmd.RunServer(cfg); err != nil {
 			slog.Error("server error", "err", err)
 			os.Exit(1)
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "No mode specified. Use -C for client or -L/-R for server.\n")
+		fmt.Fprintf(os.Stderr, "No mode specified. Use -C for client, -L/-R for server, or -L/-F for forwarder.\n")
 		os.Exit(1)
 	}
 }
@@ -51,6 +56,9 @@ func main() {
 func modeStr(cfg *pkg.Config) string {
 	if cfg.IsClient() {
 		return "client"
+	}
+	if cfg.IsForwarder() {
+		return "forwarder"
 	}
 	return "server"
 }
