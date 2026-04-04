@@ -239,6 +239,30 @@ func (s *Server) listenData(addr string) error {
 		ln.Close()
 	}()
 
+	// Periodic session distribution logging
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				poolSize, totalStreams := s.dataQueue.Stats()
+				infos := s.dataQueue.DetailedStats()
+				dist := make([]string, len(infos))
+				for i, info := range infos {
+					dist[i] = fmt.Sprintf("s%d:%d", info.ID, info.Streams)
+				}
+				slog.Debug("data pool status",
+					"pool_size", poolSize,
+					"total_streams", totalStreams,
+					"distribution", dist,
+				)
+			case <-s.ctx.Done():
+				return
+			}
+		}
+	}()
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {

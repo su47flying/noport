@@ -219,7 +219,16 @@ func (c *Client) monitorDataConns() {
 					}
 				}
 			} else {
-				slog.Debug("data pool status", "pool_size", poolSize, "active_streams", totalStreams)
+				infos := c.dataQueue.DetailedStats()
+				dist := make([]string, len(infos))
+				for i, info := range infos {
+					dist[i] = fmt.Sprintf("s%d:%d", info.ID, info.Streams)
+				}
+				slog.Debug("data pool status",
+					"pool_size", poolSize,
+					"total_streams", totalStreams,
+					"distribution", dist,
+				)
 			}
 		case <-c.ctx.Done():
 			return

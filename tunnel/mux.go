@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -24,6 +23,9 @@ const (
 	maxMuxPayload = 65536 // 64KB max payload per frame
 )
 
+// sessionIDCounter assigns a unique ID to each MuxSession for logging.
+var sessionIDCounter uint64
+
 // Buffer pools to reduce GC pressure on hot paths
 var (
 	frameBufPool = sync.Pool{
@@ -40,15 +42,30 @@ var (
 	}
 )
 
+// chunk holds a reference to a pooled buffer passed from serve() to a stream.
+type chunk struct {
+	data []byte  // payload slice (sub-slice of pooled buffer)
+	bufp *[]byte // pool pointer; returned when chunk is fully consumed
+	off  int     // read cursor within data
+}
+
+// pendingFrame is a frame queued for the writeLoop to send.
+type pendingFrame struct {
+	buf   []byte     // fully serialized frame (header + payload)
+	bufp  *[]byte    // pool pointer to return after write
+	errCh chan<- error // nil for fire-and-forget
+}
+
 // MuxSession manages multiplexed streams over a single net.Conn.
 type MuxSession struct {
+	id      uint64 // unique session ID for logging
 	conn    net.Conn
 	streams map[uint32]*MuxStream
 	mu      sync.RWMutex
 	nextID  uint32
 	closed  atomic.Bool
 	accept  chan *MuxStream
-	writeMu sync.Mutex
+	writeCh chan pendingFrame
 	// isServer determines ID parity: even IDs for server, odd for client.
 	isServer bool
 	done     chan struct{}
@@ -58,9 +75,11 @@ type MuxSession struct {
 // isServer determines stream ID allocation (even for server, odd for client).
 func NewMuxSession(conn net.Conn, isServer bool) *MuxSession {
 	s := &MuxSession{
+		id:       atomic.AddUint64(&sessionIDCounter, 1),
 		conn:     conn,
 		streams:  make(map[uint32]*MuxStream),
 		accept:   make(chan *MuxStream, 256),
+		writeCh:  make(chan pendingFrame, 256),
 		isServer: isServer,
 		done:     make(chan struct{}),
 	}
@@ -70,6 +89,7 @@ func NewMuxSession(conn net.Conn, isServer bool) *MuxSession {
 		s.nextID = 1
 	}
 	go s.serve()
+	go s.writeLoop()
 	return s
 }
 
@@ -114,6 +134,7 @@ func (s *MuxSession) Close() error {
 		return nil
 	}
 	close(s.done)
+	close(s.writeCh)
 
 	s.mu.Lock()
 	for _, st := range s.streams {
@@ -124,6 +145,11 @@ func (s *MuxSession) Close() error {
 
 	close(s.accept)
 	return s.conn.Close()
+}
+
+// ID returns the unique session identifier.
+func (s *MuxSession) ID() uint64 {
+	return s.id
 }
 
 // IsClosed returns whether the session has been closed.
@@ -202,7 +228,8 @@ func (s *MuxSession) serve() {
 				continue
 			}
 			if len(payload) > 0 {
-				st.pushData(payload)
+				st.pushData(payload, payloadBufp)
+				payloadBufp = nil // ownership transferred
 			}
 
 		case FlagClose, FlagReset:
@@ -217,15 +244,35 @@ func (s *MuxSession) serve() {
 			}
 		}
 
-		// Return pooled payload buffer (pushData copies into bytes.Buffer)
+		// Return pooled payload buffer only if ownership was not transferred
 		if payloadBufp != nil {
 			payloadBufPool.Put(payloadBufp)
 		}
 	}
 }
 
-// writeFrame writes a single mux frame to the underlying conn (thread-safe).
-// Header and payload are combined into a single write to avoid interleaving.
+// writeLoop is the single goroutine that writes frames to the underlying conn.
+// It drains writeCh until the channel is closed, ensuring frame integrity.
+func (s *MuxSession) writeLoop() {
+	for pf := range s.writeCh {
+		start := time.Now()
+		_, err := s.conn.Write(pf.buf)
+		if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+			slog.Warn("mux slow write", "session_id", s.id, "elapsed", elapsed, "frame_size", len(pf.buf))
+		}
+		frameBufPool.Put(pf.bufp)
+		if pf.errCh != nil {
+			pf.errCh <- err
+		}
+		if err != nil {
+			s.Close()
+			return
+		}
+	}
+}
+
+// writeFrame queues a single mux frame for writing via the writeLoop (thread-safe).
+// Header and payload are combined into a single buffer to avoid interleaving.
 func (s *MuxSession) writeFrame(streamID uint32, flag byte, data []byte) error {
 	if s.closed.Load() {
 		return fmt.Errorf("mux session closed")
@@ -244,12 +291,25 @@ func (s *MuxSession) writeFrame(streamID uint32, flag byte, data []byte) error {
 		copy(buf[MuxHeaderLen:], data)
 	}
 
-	s.writeMu.Lock()
-	_, err := s.conn.Write(buf)
-	s.writeMu.Unlock()
+	errCh := make(chan error, 1)
+	pf := pendingFrame{buf: buf, bufp: bufp, errCh: errCh}
 
-	frameBufPool.Put(bufp)
-	return err
+	select {
+	case s.writeCh <- pf:
+		if qlen := len(s.writeCh); qlen > 64 {
+			slog.Warn("mux write queue backlog", "session_id", s.id, "queue_depth", qlen, "stream_id", streamID)
+		}
+	case <-s.done:
+		frameBufPool.Put(bufp)
+		return fmt.Errorf("mux session closed")
+	}
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-s.done:
+		return fmt.Errorf("mux session closed")
+	}
 }
 
 func (s *MuxSession) removeStream(id uint32) {
@@ -260,14 +320,16 @@ func (s *MuxSession) removeStream(id uint32) {
 
 // MuxStream represents a single multiplexed stream within a MuxSession.
 // It implements the net.Conn interface.
-// Uses bytes.Buffer + sync.Cond instead of channel to avoid head-of-line blocking.
+// Uses a linked list of pooled chunks + sync.Cond to avoid extra copies and
+// head-of-line blocking.
 type MuxStream struct {
 	id      uint32
 	session *MuxSession
 
 	mu           sync.Mutex
 	cond         *sync.Cond
-	buf          bytes.Buffer // incoming data buffer
+	chunks       []chunk // incoming data chunks (zero-copy from serve)
+	bufLen       int     // total unread bytes across all chunks
 	closed       atomic.Bool
 	closeCh      chan struct{}
 	readDeadline time.Time // guarded by mu
@@ -283,10 +345,12 @@ func newMuxStream(id uint32, session *MuxSession) *MuxStream {
 	return st
 }
 
-// pushData appends data to the stream's buffer (called by serve(), never blocks).
-func (st *MuxStream) pushData(data []byte) {
+// pushData transfers ownership of a pooled buffer to the stream (called by
+// serve(), never blocks).  The caller must NOT return bufp to the pool.
+func (st *MuxStream) pushData(data []byte, bufp *[]byte) {
 	st.mu.Lock()
-	st.buf.Write(data)
+	st.chunks = append(st.chunks, chunk{data: data, bufp: bufp, off: 0})
+	st.bufLen += len(data)
 	st.mu.Unlock()
 	st.cond.Signal()
 }
@@ -297,7 +361,7 @@ func (st *MuxStream) Read(p []byte) (int, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	for st.buf.Len() == 0 {
+	for st.bufLen == 0 {
 		if st.closed.Load() {
 			return 0, io.EOF
 		}
@@ -318,7 +382,21 @@ func (st *MuxStream) Read(p []byte) (int, error) {
 			st.cond.Wait()
 		}
 	}
-	return st.buf.Read(p)
+	n := 0
+	for n < len(p) && len(st.chunks) > 0 {
+		c := &st.chunks[0]
+		copied := copy(p[n:], c.data[c.off:])
+		n += copied
+		c.off += copied
+		if c.off >= len(c.data) {
+			if c.bufp != nil {
+				payloadBufPool.Put(c.bufp)
+			}
+			st.chunks = st.chunks[1:]
+		}
+	}
+	st.bufLen -= n
+	return n, nil
 }
 
 // Write writes data to the stream, splitting into frames if necessary.
@@ -360,7 +438,7 @@ func (st *MuxStream) closeLocal() {
 		return
 	}
 	close(st.closeCh)
-	st.cond.Broadcast() // wake up any blocked readers
+	st.cond.Broadcast()
 }
 
 func (st *MuxStream) LocalAddr() net.Addr {

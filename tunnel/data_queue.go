@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
-	"sync/atomic"
+	"time"
 
 	"noport/crypto"
 )
@@ -16,23 +16,24 @@ var ErrNoConnections = errors.New("no connections available")
 // DataQueue manages a pool of mux sessions over encrypted TCP connections.
 // Each TCP connection in the pool carries a MuxSession for multiplexing.
 type DataQueue struct {
-	mu       sync.RWMutex
-	sessions []*MuxSession
-	cipher   crypto.Cipher
-	closed   bool
-	isServer bool
-
-	// Round-robin index for load balancing across sessions
-	rrIndex uint64
+	mu        sync.RWMutex
+	sessions  []*MuxSession
+	cipher    crypto.Cipher
+	closed    bool
+	isServer  bool
+	pruneDone chan struct{}
 }
 
 // NewDataQueue creates a new data queue pool.
 // cipher can be nil for no encryption.
 func NewDataQueue(cipher crypto.Cipher, isServer bool) *DataQueue {
-	return &DataQueue{
-		cipher:   cipher,
-		isServer: isServer,
+	dq := &DataQueue{
+		cipher:    cipher,
+		isServer:  isServer,
+		pruneDone: make(chan struct{}),
 	}
+	dq.StartPrune()
+	return dq
 }
 
 // AddConn adds a new TCP connection to the pool.
@@ -59,33 +60,38 @@ func (dq *DataQueue) AddConn(conn net.Conn) (*MuxSession, error) {
 	return session, nil
 }
 
-// GetSession returns an active MuxSession from the pool using round-robin selection.
-// Skips and removes closed sessions. Returns error if pool is empty or closed.
+// GetSession returns an active MuxSession from the pool using least-loaded selection.
+// Skips closed sessions. Returns error if pool is empty or closed.
 func (dq *DataQueue) GetSession() (*MuxSession, error) {
-	dq.mu.Lock()
-	defer dq.mu.Unlock()
+	dq.mu.RLock()
+	defer dq.mu.RUnlock()
 
 	if dq.closed {
 		return nil, ErrPoolClosed
 	}
 
-	// Remove dead sessions first
-	alive := dq.sessions[:0]
+	var best *MuxSession
+	bestStreams := -1
+	aliveCount := 0
+
 	for _, s := range dq.sessions {
-		if !s.IsClosed() {
-			alive = append(alive, s)
-		} else {
-			slog.Debug("data queue: pruned dead session")
+		if s.IsClosed() {
+			continue
+		}
+		aliveCount++
+		n := s.NumStreams()
+		if best == nil || n < bestStreams {
+			best = s
+			bestStreams = n
 		}
 	}
-	dq.sessions = alive
 
-	if len(dq.sessions) == 0 {
+	if best == nil {
 		return nil, ErrNoConnections
 	}
 
-	idx := atomic.AddUint64(&dq.rrIndex, 1) - 1
-	return dq.sessions[idx%uint64(len(dq.sessions))], nil
+	slog.Debug("data queue: selected session", "session_id", best.ID(), "streams", bestStreams, "pool_size", aliveCount)
+	return best, nil
 }
 
 // RemoveSession removes a session from the pool (e.g., when its underlying conn dies).
@@ -120,12 +126,42 @@ func (dq *DataQueue) Stats() (poolSize int, totalStreams int) {
 	return
 }
 
+// StartPrune starts a background goroutine that periodically removes dead sessions.
+func (dq *DataQueue) StartPrune() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				dq.mu.Lock()
+				if dq.closed {
+					dq.mu.Unlock()
+					return
+				}
+				alive := dq.sessions[:0]
+				for _, s := range dq.sessions {
+					if !s.IsClosed() {
+						alive = append(alive, s)
+					} else {
+						slog.Debug("data queue: pruned dead session")
+					}
+				}
+				dq.sessions = alive
+				dq.mu.Unlock()
+			case <-dq.pruneDone:
+				return
+			}
+		}
+	}()
+}
+
 // Close closes all sessions and the pool.
 func (dq *DataQueue) Close() error {
 	dq.mu.Lock()
-	defer dq.mu.Unlock()
 
 	if dq.closed {
+		dq.mu.Unlock()
 		return nil
 	}
 	dq.closed = true
@@ -137,9 +173,30 @@ func (dq *DataQueue) Close() error {
 		}
 	}
 	dq.sessions = nil
+	dq.mu.Unlock()
+
+	close(dq.pruneDone)
 
 	slog.Debug("data queue: pool closed")
 	return firstErr
+}
+
+// SessionInfo holds per-session stats for observability logging.
+type SessionInfo struct {
+	ID      uint64
+	Streams int
+	Closed  bool
+}
+
+// DetailedStats returns per-session info for periodic logging.
+func (dq *DataQueue) DetailedStats() []SessionInfo {
+	dq.mu.RLock()
+	defer dq.mu.RUnlock()
+	infos := make([]SessionInfo, len(dq.sessions))
+	for i, s := range dq.sessions {
+		infos[i] = SessionInfo{ID: s.ID(), Streams: s.NumStreams(), Closed: s.IsClosed()}
+	}
+	return infos
 }
 
 // Sessions returns a snapshot of current sessions (for iteration).

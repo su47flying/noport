@@ -51,7 +51,7 @@ func TestAddConn(t *testing.T) {
 	}
 }
 
-func TestGetSessionRoundRobin(t *testing.T) {
+func TestGetSessionLeastLoaded(t *testing.T) {
 	dq := NewDataQueue(nil, false)
 
 	c1, _ := newPipeConn(t)
@@ -61,15 +61,33 @@ func TestGetSessionRoundRobin(t *testing.T) {
 	c3, _ := newPipeConn(t)
 	s3, _ := dq.AddConn(c3)
 
-	expected := []*MuxSession{s1, s2, s3, s1, s2, s3}
-	for i, want := range expected {
-		got, err := dq.GetSession()
-		if err != nil {
-			t.Fatalf("GetSession call %d failed: %v", i, err)
-		}
-		if got != want {
-			t.Fatalf("GetSession call %d: expected session %p, got %p", i, want, got)
-		}
+	// All sessions have 0 streams — should return a valid session
+	got, err := dq.GetSession()
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if got != s1 && got != s2 && got != s3 {
+		t.Fatalf("GetSession returned unknown session %p", got)
+	}
+
+	// Simulate load on s1 by directly adding fake streams to its map
+	s1.mu.Lock()
+	s1.streams[100] = newMuxStream(100, s1)
+	s1.streams[101] = newMuxStream(101, s1)
+	s1.mu.Unlock()
+
+	s2.mu.Lock()
+	s2.streams[200] = newMuxStream(200, s2)
+	s2.mu.Unlock()
+
+	// s3 has 0 streams, s2 has 1, s1 has 2 — should pick s3
+	got, err = dq.GetSession()
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if got != s3 {
+		t.Fatalf("GetSession should return least loaded session s3, got %p (s1=%p s2=%p s3=%p)",
+			got, s1, s2, s3)
 	}
 }
 
