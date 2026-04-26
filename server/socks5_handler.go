@@ -67,6 +67,7 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 		protocol.WriteSocks5Reply(conn, protocol.RepGeneralFailure, nil, 0)
 		return
 	}
+	defer s.dataQueue.CloseSession(session)
 	sessionElapsed := time.Since(sessionStart)
 
 	// Step 4: Open a mux stream
@@ -132,6 +133,7 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 	// Step 7: Relay data bidirectionally
 	stats := pkg.Relay(conn, stream, &relayBufPool)
 	slog.Info("relay done", "target", target,
+		"session_id", session.ID(),
 		"duration", stats.Duration.Round(time.Millisecond),
 		"upload", stats.AToB.Bytes,
 		"download", stats.BToA.Bytes,

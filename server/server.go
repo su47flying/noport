@@ -18,7 +18,19 @@ import (
 	"noport/tunnel"
 )
 
-const defaultKey = "noport-default-key"
+const (
+	defaultKey = "noport-default-key"
+
+	// Each proxied request checks out one dedicated data session and retires
+	// it when the request finishes. Keep enough idle data connections ready
+	// to avoid per-request setup latency, but cap idle sockets so failed or
+	// bursty traffic does not grow the pool without bound.
+	dataPoolMinIdle       = 8
+	dataPoolMaxIdle       = 32
+	dataPoolMaintainEvery = 3 * time.Second
+	dataSessionMaxRetries = 5
+	dataSessionRetryDelay = 500 * time.Millisecond
+)
 
 type Server struct {
 	cfg        *pkg.Config
@@ -239,22 +251,31 @@ func (s *Server) listenData(addr string) error {
 		ln.Close()
 	}()
 
-	// Periodic session distribution logging
+	// Periodic session distribution logging and idle-pool maintenance.
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(dataPoolMaintainEvery)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				poolSize, totalStreams := s.dataQueue.Stats()
+				s.maintainDataPool("periodic")
+				total, idle, busy := s.dataQueue.PoolStats()
 				infos := s.dataQueue.DetailedStats()
 				dist := make([]string, len(infos))
 				for i, info := range infos {
-					dist[i] = fmt.Sprintf("s%d:%d", info.ID, info.Streams)
+					state := "busy"
+					if info.Idle {
+						state = "idle"
+					}
+					if info.Closed {
+						state = "closed"
+					}
+					dist[i] = fmt.Sprintf("s%d:%d/%s", info.ID, info.Streams, state)
 				}
 				slog.Debug("data pool status",
-					"pool_size", poolSize,
-					"total_streams", totalStreams,
+					"pool_size", total,
+					"idle", idle,
+					"busy", busy,
 					"distribution", dist,
 				)
 			case <-s.ctx.Done():
@@ -357,34 +378,69 @@ func (s *Server) requestDataConn() {
 	}
 }
 
-// getSessionWithRetry attempts to get a mux session, requesting new data
-// connections from the client if none are available.
-func (s *Server) getSessionWithRetry() (*tunnel.MuxSession, error) {
-	const maxRetries = 5
-	const retryDelay = 500 * time.Millisecond
+// maintainDataPool keeps the idle data-connection pool between configured
+// bounds. Busy sessions are never closed; excess idle sessions are trimmed.
+func (s *Server) maintainDataPool(reason string) {
+	total, idle, busy := s.dataQueue.PoolStats()
+	if idle < dataPoolMinIdle {
+		deficit := dataPoolMinIdle - idle
+		slog.Debug("data pool below idle minimum, requesting connections",
+			"reason", reason,
+			"total", total,
+			"idle", idle,
+			"busy", busy,
+			"min_idle", dataPoolMinIdle,
+			"request_count", deficit,
+		)
+		for i := 0; i < deficit; i++ {
+			s.requestDataConn()
+		}
+	}
 
-	for i := 0; i < maxRetries; i++ {
+	if idle > dataPoolMaxIdle {
+		closed := s.dataQueue.CloseIdleExcess(dataPoolMaxIdle)
+		if closed > 0 {
+			slog.Info("trimmed excess idle data connections",
+				"reason", reason,
+				"idle_before", idle,
+				"max_idle", dataPoolMaxIdle,
+				"closed", closed,
+			)
+		}
+	}
+}
+
+// getSessionWithRetry checks out one idle mux session exclusively for one
+// proxied request. The caller must retire it with dataQueue.CloseSession
+// when the request completes; sessions are intentionally not reused.
+func (s *Server) getSessionWithRetry() (*tunnel.MuxSession, error) {
+	for i := 0; i < dataSessionMaxRetries; i++ {
 		session, err := s.dataQueue.GetSession()
 		if err == nil {
+			s.maintainDataPool("checkout")
 			return session, nil
 		}
 
-		poolSize := s.dataQueue.Size()
+		total, idle, busy := s.dataQueue.PoolStats()
 		slog.Warn("no data session available, requesting from client",
 			"attempt", i+1,
-			"max_retries", maxRetries,
-			"pool_size", poolSize,
+			"max_retries", dataSessionMaxRetries,
+			"pool_size", total,
+			"idle", idle,
+			"busy", busy,
 			"err", err,
 		)
 		s.requestDataConn()
-		time.Sleep(retryDelay)
+		time.Sleep(dataSessionRetryDelay)
 	}
 
-	poolSize := s.dataQueue.Size()
+	total, idle, busy := s.dataQueue.PoolStats()
 	slog.Error("EXHAUSTED: no data connections after all retries",
-		"pool_size", poolSize,
+		"pool_size", total,
+		"idle", idle,
+		"busy", busy,
 	)
-	return nil, fmt.Errorf("no data connections available after retries (pool_size=%d)", poolSize)
+	return nil, fmt.Errorf("no idle data connections available after retries (pool_size=%d idle=%d busy=%d)", total, idle, busy)
 }
 
 // writeTargetToStream writes the target address as a length-prefixed string

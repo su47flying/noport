@@ -59,6 +59,7 @@ func (s *Server) handleHTTPConnect(conn net.Conn, target string, remote net.Addr
 		protocol.WriteHTTPError(conn, 502, "no tunnel available")
 		return
 	}
+	defer s.dataQueue.CloseSession(session)
 	sessionElapsed := time.Since(sessionStart)
 
 	streamStart := time.Now()
@@ -111,6 +112,7 @@ func (s *Server) handleHTTPConnect(conn net.Conn, target string, remote net.Addr
 
 	stats := pkg.Relay(conn, stream, &relayBufPool)
 	slog.Info("http connect relay done", "target", target,
+		"session_id", session.ID(),
 		"duration", stats.Duration.Round(time.Millisecond),
 		"upload", stats.AToB.Bytes, "download", stats.BToA.Bytes,
 		"upload_result", stats.AToB.Result, "download_result", stats.BToA.Result,
@@ -133,6 +135,7 @@ func (s *Server) handleHTTPPlain(conn net.Conn, br *bufio.Reader, req *http.Requ
 		protocol.WriteHTTPError(conn, 502, "no tunnel available")
 		return
 	}
+	defer s.dataQueue.CloseSession(session)
 	sessionElapsed := time.Since(sessionStart)
 
 	streamStart := time.Now()
@@ -201,6 +204,7 @@ func (s *Server) handleHTTPPlain(conn net.Conn, br *bufio.Reader, req *http.Requ
 	// Relay response back: stream → conn, conn → stream
 	stats := pkg.Relay(conn, stream, &relayBufPool)
 	slog.Info("http plain relay done", "target", target,
+		"session_id", session.ID(),
 		"method", req.Method, "path", req.URL.Path,
 		"duration", stats.Duration.Round(time.Millisecond),
 		"upload", stats.AToB.Bytes, "download", stats.BToA.Bytes,

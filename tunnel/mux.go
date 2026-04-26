@@ -134,7 +134,6 @@ func (s *MuxSession) Close() error {
 		return nil
 	}
 	close(s.done)
-	close(s.writeCh)
 
 	s.mu.Lock()
 	for _, st := range s.streams {
@@ -252,21 +251,31 @@ func (s *MuxSession) serve() {
 }
 
 // writeLoop is the single goroutine that writes frames to the underlying conn.
-// It drains writeCh until the channel is closed, ensuring frame integrity.
+// writeCh is intentionally not closed by Close(): stream.Close may race with
+// session teardown and attempt to enqueue a final FlagClose. The done channel
+// is the shutdown signal; writeFrame also watches done before sending.
 func (s *MuxSession) writeLoop() {
-	for pf := range s.writeCh {
-		start := time.Now()
-		_, err := s.conn.Write(pf.buf)
-		if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
-			slog.Warn("mux slow write", "session_id", s.id, "elapsed", elapsed, "frame_size", len(pf.buf))
-		}
-		frameBufPool.Put(pf.bufp)
-		if pf.errCh != nil {
-			pf.errCh <- err
-		}
-		if err != nil {
-			s.Close()
+	for {
+		select {
+		case <-s.done:
 			return
+		case pf := <-s.writeCh:
+			start := time.Now()
+			_, err := s.conn.Write(pf.buf)
+			if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+				slog.Warn("mux slow write", "session_id", s.id, "elapsed", elapsed, "frame_size", len(pf.buf))
+			}
+			frameBufPool.Put(pf.bufp)
+			if pf.errCh != nil {
+				select {
+				case pf.errCh <- err:
+				default:
+				}
+			}
+			if err != nil {
+				s.Close()
+				return
+			}
 		}
 	}
 }

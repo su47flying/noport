@@ -20,9 +20,11 @@ import (
 )
 
 const (
-	initialDataConns = 10
-	minDataConns     = 5
-	dialTimeout      = 10 * time.Second
+	initialDataConns      = 8
+	minIdleDataConns      = 8
+	maxIdleDataConns      = 32
+	dataPoolMaintainEvery = 3 * time.Second
+	dialTimeout           = 10 * time.Second
 )
 
 type Client struct {
@@ -92,14 +94,6 @@ func (c *Client) Run() error {
 		}
 	}
 	slog.Info("data connections established", "count", c.dataQueue.Size())
-
-	for _, session := range c.dataQueue.Sessions() {
-		c.wg.Add(1)
-		go func(s *tunnel.MuxSession) {
-			defer c.wg.Done()
-			c.serveSession(s)
-		}(session)
-	}
 
 	// Monitor admin queue and reconnect on disconnect
 	c.wg.Add(1)
@@ -204,32 +198,56 @@ func (c *Client) onAdminMessage(msg *protocol.AdminMessage) {
 
 // monitorDataConns periodically checks pool size and replenishes if needed.
 func (c *Client) monitorDataConns() {
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(dataPoolMaintainEvery)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			poolSize, totalStreams := c.dataQueue.Stats()
-			if poolSize < minDataConns {
-				slog.Warn("data pool below minimum, adding connections",
-					"current", poolSize, "min", minDataConns, "active_streams", totalStreams)
-				for i := poolSize; i < initialDataConns; i++ {
+			total, idle, busy := c.dataQueue.PoolStats()
+			if idle < minIdleDataConns {
+				deficit := minIdleDataConns - idle
+				slog.Warn("data pool below idle minimum, adding connections",
+					"total", total,
+					"idle", idle,
+					"busy", busy,
+					"min_idle", minIdleDataConns,
+					"add_count", deficit,
+				)
+				for i := 0; i < deficit; i++ {
 					if err := c.connectData(); err != nil {
 						slog.Warn("failed to replenish data connection", "err", err)
 					}
 				}
-			} else {
-				infos := c.dataQueue.DetailedStats()
-				dist := make([]string, len(infos))
-				for i, info := range infos {
-					dist[i] = fmt.Sprintf("s%d:%d", info.ID, info.Streams)
-				}
-				slog.Debug("data pool status",
-					"pool_size", poolSize,
-					"total_streams", totalStreams,
-					"distribution", dist,
-				)
 			}
+			if idle > maxIdleDataConns {
+				closed := c.dataQueue.CloseIdleExcess(maxIdleDataConns)
+				if closed > 0 {
+					slog.Info("trimmed excess idle data connections",
+						"idle_before", idle,
+						"max_idle", maxIdleDataConns,
+						"closed", closed,
+					)
+				}
+			}
+
+			infos := c.dataQueue.DetailedStats()
+			dist := make([]string, len(infos))
+			for i, info := range infos {
+				state := "busy"
+				if info.Idle {
+					state = "idle"
+				}
+				if info.Closed {
+					state = "closed"
+				}
+				dist[i] = fmt.Sprintf("s%d:%d/%s", info.ID, info.Streams, state)
+			}
+			slog.Debug("data pool status",
+				"pool_size", total,
+				"idle", idle,
+				"busy", busy,
+				"distribution", dist,
+			)
 		case <-c.ctx.Done():
 			return
 		}
