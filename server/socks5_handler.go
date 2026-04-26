@@ -8,6 +8,7 @@ import (
 
 	"noport/pkg"
 	"noport/protocol"
+	"noport/tunnel"
 )
 
 const (
@@ -55,9 +56,10 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 	slog.Debug("socks5 connect", "target", target, "remote", remote,
 		"pool_size", poolSize, "active_streams", totalStreams)
 
-	// Step 3: Get a MuxSession from data queue (with retry)
+	// Step 3: Get a MuxSession from data queue (with retry); host-aware
+	// so heavy targets land on a dedicated session.
 	sessionStart := time.Now()
-	session, err := s.getSessionWithRetry()
+	session, dedicated, err := s.getSessionForTarget(target)
 	if err != nil {
 		slog.Error("no session for socks5", "err", err, "target", target, "remote", remote,
 			"handshake", handshakeElapsed.Round(time.Millisecond),
@@ -129,8 +131,13 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 		"reply_write", replyElapsed.Round(time.Millisecond),
 		"setup_total", time.Since(start).Round(time.Millisecond))
 
-	// Step 7: Relay data bidirectionally
-	stats := pkg.Relay(conn, stream, &relayBufPool)
+	// Step 7: Relay data bidirectionally. Wrap the mux stream end so we can
+	// notice when this stream alone has moved enough payload to mark the
+	// target host as heavy — future streams to that host will then be
+	// isolated onto a dedicated MuxSession.
+	host := tunnel.HostOnly(target)
+	watch := newPromoteWatchConn(stream, host, s.heavyHosts.Mark)
+	stats := pkg.Relay(conn, watch, &relayBufPool)
 	slog.Info("relay done", "target", target,
 		"duration", stats.Duration.Round(time.Millisecond),
 		"upload", stats.AToB.Bytes,
@@ -141,5 +148,6 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 		"download_ttfb", stats.BToA.FirstByte.Round(time.Millisecond),
 		"upload_started", stats.AToB.FirstByteSeen,
 		"download_started", stats.BToA.FirstByteSeen,
+		"dedicated", dedicated,
 	)
 }

@@ -10,6 +10,7 @@ import (
 
 	"noport/pkg"
 	"noport/protocol"
+	"noport/tunnel"
 )
 
 const httpHandshakeTimeout = 10 * time.Second
@@ -50,7 +51,7 @@ func (s *Server) handleHTTPConn(conn net.Conn) {
 // handleHTTPConnect handles CONNECT method (HTTPS tunneling).
 func (s *Server) handleHTTPConnect(conn net.Conn, target string, remote net.Addr, parseElapsed time.Duration, start time.Time) {
 	sessionStart := time.Now()
-	session, err := s.getSessionWithRetry()
+	session, dedicated, err := s.getSessionForTarget(target)
 	if err != nil {
 		slog.Error("no session for http connect", "err", err, "target", target, "remote", remote,
 			"request_parse", parseElapsed.Round(time.Millisecond),
@@ -109,7 +110,9 @@ func (s *Server) handleHTTPConnect(conn net.Conn, target string, remote net.Addr
 		"response_write", responseElapsed.Round(time.Millisecond),
 		"setup_total", time.Since(start).Round(time.Millisecond))
 
-	stats := pkg.Relay(conn, stream, &relayBufPool)
+	host := tunnel.HostOnly(target)
+	watch := newPromoteWatchConn(stream, host, s.heavyHosts.Mark)
+	stats := pkg.Relay(conn, watch, &relayBufPool)
 	slog.Info("http connect relay done", "target", target,
 		"duration", stats.Duration.Round(time.Millisecond),
 		"upload", stats.AToB.Bytes, "download", stats.BToA.Bytes,
@@ -117,14 +120,15 @@ func (s *Server) handleHTTPConnect(conn net.Conn, target string, remote net.Addr
 		"upload_ttfb", stats.AToB.FirstByte.Round(time.Millisecond),
 		"download_ttfb", stats.BToA.FirstByte.Round(time.Millisecond),
 		"upload_started", stats.AToB.FirstByteSeen,
-		"download_started", stats.BToA.FirstByteSeen)
+		"download_started", stats.BToA.FirstByteSeen,
+		"dedicated", dedicated)
 }
 
 // handleHTTPPlain handles plain HTTP requests (GET, POST, etc.)
 // by forwarding through the tunnel.
 func (s *Server) handleHTTPPlain(conn net.Conn, br *bufio.Reader, req *http.Request, target string, remote net.Addr, parseElapsed time.Duration, start time.Time) {
 	sessionStart := time.Now()
-	session, err := s.getSessionWithRetry()
+	session, dedicated, err := s.getSessionForTarget(target)
 	if err != nil {
 		slog.Error("no session for http plain", "err", err, "target", target, "remote", remote,
 			"request_parse", parseElapsed.Round(time.Millisecond),
@@ -199,7 +203,9 @@ func (s *Server) handleHTTPPlain(conn net.Conn, br *bufio.Reader, req *http.Requ
 		"setup_total", time.Since(start).Round(time.Millisecond))
 
 	// Relay response back: stream → conn, conn → stream
-	stats := pkg.Relay(conn, stream, &relayBufPool)
+	host := tunnel.HostOnly(target)
+	watch := newPromoteWatchConn(stream, host, s.heavyHosts.Mark)
+	stats := pkg.Relay(conn, watch, &relayBufPool)
 	slog.Info("http plain relay done", "target", target,
 		"method", req.Method, "path", req.URL.Path,
 		"duration", stats.Duration.Round(time.Millisecond),
@@ -208,5 +214,6 @@ func (s *Server) handleHTTPPlain(conn net.Conn, br *bufio.Reader, req *http.Requ
 		"upload_ttfb", stats.AToB.FirstByte.Round(time.Millisecond),
 		"download_ttfb", stats.BToA.FirstByte.Round(time.Millisecond),
 		"upload_started", stats.AToB.FirstByteSeen,
-		"download_started", stats.BToA.FirstByteSeen)
+		"download_started", stats.BToA.FirstByteSeen,
+		"dedicated", dedicated)
 }

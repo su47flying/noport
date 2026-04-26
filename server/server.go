@@ -18,13 +18,22 @@ import (
 	"noport/tunnel"
 )
 
-const defaultKey = "noport-default-key"
+const (
+	defaultKey = "noport-default-key"
+
+	// heavyHostTTL is how long a host stays marked heavy after its last
+	// observed >threshold stream. Tuned for video sessions: long enough
+	// to span an ad break or a brief seek, short enough that an idle host
+	// returns to the shared pool quickly.
+	heavyHostTTL = 10 * time.Minute
+)
 
 type Server struct {
 	cfg        *pkg.Config
 	cipher     crypto.Cipher
 	adminQueue *tunnel.AdminQueue
 	dataQueue  *tunnel.DataQueue
+	heavyHosts *tunnel.HeavyHostSet
 	ctx        context.Context
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
@@ -77,13 +86,14 @@ func New(cfg *pkg.Config) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	srv := &Server{
-		cfg:       cfg,
-		cipher:    cipher,
-		dataQueue: tunnel.NewDataQueue(cipher, true),
-		ctx:       ctx,
-		cancel:    cancel,
-		adminAddr: fmt.Sprintf("%s:%d", adminEp.Host, adminEp.Port),
-		dataAddr:  fmt.Sprintf("%s:%d", dataEp.Host, dataEp.Port),
+		cfg:        cfg,
+		cipher:     cipher,
+		dataQueue:  tunnel.NewDataQueue(cipher, true),
+		heavyHosts: tunnel.NewHeavyHostSet(heavyHostTTL),
+		ctx:        ctx,
+		cancel:     cancel,
+		adminAddr:  fmt.Sprintf("%s:%d", adminEp.Host, adminEp.Port),
+		dataAddr:   fmt.Sprintf("%s:%d", dataEp.Host, dataEp.Port),
 	}
 
 	if hasSocks5 {
@@ -176,6 +186,9 @@ func (s *Server) Shutdown() {
 		s.adminQueue.Close()
 	}
 	s.dataQueue.Close()
+	if s.heavyHosts != nil {
+		s.heavyHosts.Close()
+	}
 }
 
 func (s *Server) listenAdmin(addr string) error {
@@ -239,23 +252,34 @@ func (s *Server) listenData(addr string) error {
 		ln.Close()
 	}()
 
-	// Periodic session distribution logging
+	// Periodic session distribution logging + reservation maintenance.
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
+				// Drop reservations whose host is no longer heavy so the
+				// dedicated session can rejoin the shared pool.
+				s.dataQueue.ReleaseExpiredReservations(s.heavyHosts)
+
 				poolSize, totalStreams := s.dataQueue.Stats()
 				infos := s.dataQueue.DetailedStats()
 				dist := make([]string, len(infos))
 				for i, info := range infos {
-					dist[i] = fmt.Sprintf("s%d:%d/%dKB", info.ID, info.Streams, info.Inflight/1024)
+					tag := ""
+					if info.ReservedFor != "" {
+						tag = "*" + info.ReservedFor
+					}
+					dist[i] = fmt.Sprintf("s%d:%d/%dKB%s",
+						info.ID, info.Streams, info.Inflight/1024, tag)
 				}
+				heavy := s.heavyHosts.Snapshot()
 				slog.Debug("data pool status",
 					"pool_size", poolSize,
 					"total_streams", totalStreams,
 					"distribution", dist,
+					"heavy_hosts", heavy,
 				)
 			case <-s.ctx.Done():
 				return
@@ -358,16 +382,18 @@ func (s *Server) requestDataConn() {
 	}
 }
 
-// getSessionWithRetry attempts to get a mux session, requesting new data
-// connections from the client if none are available.
-func (s *Server) getSessionWithRetry() (*tunnel.MuxSession, error) {
+// getSessionForTarget returns a MuxSession suitable for `target`, applying
+// host-based isolation when the target's host is currently marked heavy.
+// Falls back to the regular least-loaded picker for ordinary traffic.
+// Triggers admin-driven pool replenishment if the pool runs dry.
+func (s *Server) getSessionForTarget(target string) (*tunnel.MuxSession, bool, error) {
 	const maxRetries = 5
 	const retryDelay = 500 * time.Millisecond
 
 	for i := 0; i < maxRetries; i++ {
-		session, err := s.dataQueue.GetSession()
+		session, reserved, err := s.dataQueue.GetSessionForTarget(target, s.heavyHosts)
 		if err == nil {
-			return session, nil
+			return session, reserved, nil
 		}
 
 		poolSize := s.dataQueue.Size()
@@ -375,6 +401,7 @@ func (s *Server) getSessionWithRetry() (*tunnel.MuxSession, error) {
 			"attempt", i+1,
 			"max_retries", maxRetries,
 			"pool_size", poolSize,
+			"target", target,
 			"err", err,
 		)
 		s.requestDataConn()
@@ -384,8 +411,9 @@ func (s *Server) getSessionWithRetry() (*tunnel.MuxSession, error) {
 	poolSize := s.dataQueue.Size()
 	slog.Error("EXHAUSTED: no data connections after all retries",
 		"pool_size", poolSize,
+		"target", target,
 	)
-	return nil, fmt.Errorf("no data connections available after retries (pool_size=%d)", poolSize)
+	return nil, false, fmt.Errorf("no data connections available after retries (pool_size=%d)", poolSize)
 }
 
 // writeTargetToStream writes the target address as a length-prefixed string
