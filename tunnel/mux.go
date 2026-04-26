@@ -20,7 +20,10 @@ const (
 	FlagClose byte = 0x02
 	FlagReset byte = 0x03
 
-	maxMuxPayload = 65536 // 64KB max payload per frame
+	// Keep individual mux writes small so a constrained upstream cannot
+	// stall a stream behind a single large 64KB TCP write for several
+	// seconds. The header overhead is still negligible for video traffic.
+	maxMuxPayload = 16 * 1024
 )
 
 // sessionIDCounter assigns a unique ID to each MuxSession for logging.
@@ -51,8 +54,8 @@ type chunk struct {
 
 // pendingFrame is a frame queued for the writeLoop to send.
 type pendingFrame struct {
-	buf   []byte     // fully serialized frame (header + payload)
-	bufp  *[]byte    // pool pointer to return after write
+	buf   []byte       // fully serialized frame (header + payload)
+	bufp  *[]byte      // pool pointer to return after write
 	errCh chan<- error // nil for fire-and-forget
 }
 

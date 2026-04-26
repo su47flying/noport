@@ -28,18 +28,21 @@ const (
 	dataPoolMinIdle       = 8
 	dataPoolMaxIdle       = 32
 	dataPoolMaintainEvery = 3 * time.Second
-	dataSessionMaxRetries = 5
-	dataSessionRetryDelay = 500 * time.Millisecond
+	dataSessionWait       = 30 * time.Second
+	dataSessionRetryDelay = 250 * time.Millisecond
 )
 
 type Server struct {
-	cfg        *pkg.Config
-	cipher     crypto.Cipher
-	adminQueue *tunnel.AdminQueue
-	dataQueue  *tunnel.DataQueue
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	cfg          *pkg.Config
+	cipher       crypto.Cipher
+	adminMu      sync.RWMutex
+	adminQueue   *tunnel.AdminQueue
+	dataQueue    *tunnel.DataQueue
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	poolSignalMu sync.Mutex
+	poolChanged  chan struct{}
 
 	adminAddr  string
 	dataAddr   string
@@ -89,13 +92,14 @@ func New(cfg *pkg.Config) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	srv := &Server{
-		cfg:       cfg,
-		cipher:    cipher,
-		dataQueue: tunnel.NewDataQueue(cipher, true),
-		ctx:       ctx,
-		cancel:    cancel,
-		adminAddr: fmt.Sprintf("%s:%d", adminEp.Host, adminEp.Port),
-		dataAddr:  fmt.Sprintf("%s:%d", dataEp.Host, dataEp.Port),
+		cfg:         cfg,
+		cipher:      cipher,
+		dataQueue:   tunnel.NewDataQueue(cipher, true),
+		ctx:         ctx,
+		cancel:      cancel,
+		poolChanged: make(chan struct{}),
+		adminAddr:   fmt.Sprintf("%s:%d", adminEp.Host, adminEp.Port),
+		dataAddr:    fmt.Sprintf("%s:%d", dataEp.Host, dataEp.Port),
 	}
 
 	if hasSocks5 {
@@ -184,8 +188,11 @@ func (s *Server) Run() error {
 
 func (s *Server) Shutdown() {
 	s.cancel()
-	if s.adminQueue != nil {
-		s.adminQueue.Close()
+	s.adminMu.RLock()
+	adminQueue := s.adminQueue
+	s.adminMu.RUnlock()
+	if adminQueue != nil {
+		adminQueue.Close()
 	}
 	s.dataQueue.Close()
 }
@@ -218,18 +225,18 @@ func (s *Server) listenAdmin(addr string) error {
 
 		slog.Info("admin client connected", "remote", conn.RemoteAddr())
 
-		// Close previous admin queue if exists
-		if s.adminQueue != nil {
-			s.adminQueue.Close()
-		}
-
-		s.adminQueue = tunnel.NewAdminQueue(conn, func(msg *protocol.AdminMessage) {
+		adminQueue := tunnel.NewAdminQueue(conn, func(msg *protocol.AdminMessage) {
 			slog.Debug("admin message received", "type", msg.Type)
 		})
+		if old := s.setAdminQueue(adminQueue); old != nil {
+			old.Close()
+		}
+		s.maintainDataPool("admin_connected")
 
 		// Wait for this admin connection to close, then loop back to accept
 		select {
-		case <-s.adminQueue.Done():
+		case <-adminQueue.Done():
+			s.clearAdminQueue(adminQueue)
 			slog.Info("admin connection closed, waiting for reconnect")
 		case <-s.ctx.Done():
 			return nil
@@ -300,6 +307,8 @@ func (s *Server) listenData(addr string) error {
 		if _, err := s.dataQueue.AddConn(conn); err != nil {
 			slog.Error("failed to add data connection", "err", err)
 			conn.Close()
+		} else {
+			s.notifyDataPoolChanged()
 		}
 	}
 }
@@ -366,15 +375,70 @@ func (s *Server) listenHTTP(addr string) error {
 	}
 }
 
-// requestDataConn sends a CreateDataConn message to the client via admin queue.
-func (s *Server) requestDataConn() {
-	if s.adminQueue == nil {
-		slog.Warn("no admin connection, cannot request data conn")
+func (s *Server) setAdminQueue(adminQueue *tunnel.AdminQueue) *tunnel.AdminQueue {
+	s.adminMu.Lock()
+	old := s.adminQueue
+	s.adminQueue = adminQueue
+	s.adminMu.Unlock()
+	s.notifyDataPoolChanged()
+	return old
+}
+
+func (s *Server) clearAdminQueue(adminQueue *tunnel.AdminQueue) {
+	s.adminMu.Lock()
+	if s.adminQueue == adminQueue {
+		s.adminQueue = nil
+	}
+	s.adminMu.Unlock()
+	s.notifyDataPoolChanged()
+}
+
+func (s *Server) currentAdminQueue() *tunnel.AdminQueue {
+	s.adminMu.RLock()
+	adminQueue := s.adminQueue
+	s.adminMu.RUnlock()
+	return adminQueue
+}
+
+func (s *Server) notifyDataPoolChanged() {
+	s.poolSignalMu.Lock()
+	close(s.poolChanged)
+	s.poolChanged = make(chan struct{})
+	s.poolSignalMu.Unlock()
+}
+
+func (s *Server) waitForDataPoolChange(timeout time.Duration) {
+	if timeout <= 0 {
 		return
 	}
-	msg := protocol.NewCreateDataConnMsg()
-	if err := s.adminQueue.Send(msg); err != nil {
-		slog.Error("failed to send CreateDataConn", "err", err)
+	s.poolSignalMu.Lock()
+	ch := s.poolChanged
+	s.poolSignalMu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ch:
+	case <-timer.C:
+	case <-s.ctx.Done():
+	}
+}
+
+// requestDataConns sends CreateDataConn messages to the client via the admin queue.
+func (s *Server) requestDataConns(count int) {
+	if count <= 0 {
+		return
+	}
+	adminQueue := s.currentAdminQueue()
+	if adminQueue == nil {
+		slog.Warn("no admin connection, cannot request data conns", "request_count", count)
+		return
+	}
+	for i := 0; i < count; i++ {
+		if err := adminQueue.Send(protocol.NewCreateDataConnMsg()); err != nil {
+			slog.Error("failed to send CreateDataConn", "err", err)
+			return
+		}
 	}
 }
 
@@ -392,9 +456,7 @@ func (s *Server) maintainDataPool(reason string) {
 			"min_idle", dataPoolMinIdle,
 			"request_count", deficit,
 		)
-		for i := 0; i < deficit; i++ {
-			s.requestDataConn()
-		}
+		s.requestDataConns(deficit)
 	}
 
 	if idle > dataPoolMaxIdle {
@@ -414,7 +476,9 @@ func (s *Server) maintainDataPool(reason string) {
 // proxied request. The caller must retire it with dataQueue.CloseSession
 // when the request completes; sessions are intentionally not reused.
 func (s *Server) getSessionWithRetry() (*tunnel.MuxSession, error) {
-	for i := 0; i < dataSessionMaxRetries; i++ {
+	deadline := time.Now().Add(dataSessionWait)
+	attempt := 0
+	for {
 		session, err := s.dataQueue.GetSession()
 		if err == nil {
 			s.maintainDataPool("checkout")
@@ -422,25 +486,41 @@ func (s *Server) getSessionWithRetry() (*tunnel.MuxSession, error) {
 		}
 
 		total, idle, busy := s.dataQueue.PoolStats()
-		slog.Warn("no data session available, requesting from client",
-			"attempt", i+1,
-			"max_retries", dataSessionMaxRetries,
-			"pool_size", total,
-			"idle", idle,
-			"busy", busy,
-			"err", err,
-		)
-		s.requestDataConn()
-		time.Sleep(dataSessionRetryDelay)
-	}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			slog.Error("EXHAUSTED: no data connections after wait",
+				"pool_size", total,
+				"idle", idle,
+				"busy", busy,
+				"wait", dataSessionWait,
+			)
+			return nil, fmt.Errorf("no idle data connections available after %s (pool_size=%d idle=%d busy=%d)", dataSessionWait, total, idle, busy)
+		}
 
-	total, idle, busy := s.dataQueue.PoolStats()
-	slog.Error("EXHAUSTED: no data connections after all retries",
-		"pool_size", total,
-		"idle", idle,
-		"busy", busy,
-	)
-	return nil, fmt.Errorf("no idle data connections available after retries (pool_size=%d idle=%d busy=%d)", total, idle, busy)
+		attempt++
+		if attempt == 1 || attempt%20 == 0 {
+			slog.Warn("no idle data session available, waiting for client",
+				"attempt", attempt,
+				"pool_size", total,
+				"idle", idle,
+				"busy", busy,
+				"wait_remaining", remaining.Round(time.Millisecond),
+				"err", err,
+			)
+		}
+		s.maintainDataPool("session_wait")
+		wait := dataSessionRetryDelay
+		if remaining < wait {
+			wait = remaining
+		}
+		s.waitForDataPoolChange(wait)
+	}
+}
+
+func (s *Server) retireSession(session *tunnel.MuxSession) {
+	s.dataQueue.CloseSession(session)
+	s.notifyDataPoolChanged()
+	s.maintainDataPool("retire")
 }
 
 // writeTargetToStream writes the target address as a length-prefixed string

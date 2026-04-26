@@ -59,7 +59,7 @@ func (s *Server) handleHTTPConnect(conn net.Conn, target string, remote net.Addr
 		protocol.WriteHTTPError(conn, 502, "no tunnel available")
 		return
 	}
-	defer s.dataQueue.CloseSession(session)
+	defer s.retireSession(session)
 	sessionElapsed := time.Since(sessionStart)
 
 	streamStart := time.Now()
@@ -135,7 +135,7 @@ func (s *Server) handleHTTPPlain(conn net.Conn, br *bufio.Reader, req *http.Requ
 		protocol.WriteHTTPError(conn, 502, "no tunnel available")
 		return
 	}
-	defer s.dataQueue.CloseSession(session)
+	defer s.retireSession(session)
 	sessionElapsed := time.Since(sessionStart)
 
 	streamStart := time.Now()

@@ -67,7 +67,7 @@ func (s *Server) handleSocks5Conn(conn net.Conn) {
 		protocol.WriteSocks5Reply(conn, protocol.RepGeneralFailure, nil, 0)
 		return
 	}
-	defer s.dataQueue.CloseSession(session)
+	defer s.retireSession(session)
 	sessionElapsed := time.Since(sessionStart)
 
 	// Step 4: Open a mux stream

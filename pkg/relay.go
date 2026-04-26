@@ -28,10 +28,10 @@ type RelayStats struct {
 // Relay copies data bidirectionally between two net.Conns and records per-direction stats.
 func Relay(a, b net.Conn, bufPool *sync.Pool) RelayStats {
 	start := time.Now()
-	done := make(chan RelayDirectionStats, 1)
+	aToBDone := make(chan RelayDirectionStats, 1)
 
 	go func() {
-		done <- relayOneWay(b, a, bufPool, start)
+		aToBDone <- relayOneWay(b, a, bufPool, start)
 		if tc, ok := b.(interface{ CloseWrite() error }); ok {
 			_ = tc.CloseWrite()
 		} else {
@@ -39,14 +39,14 @@ func Relay(a, b net.Conn, bufPool *sync.Pool) RelayStats {
 		}
 	}()
 
-	aToB := relayOneWay(a, b, bufPool, start)
+	bToA := relayOneWay(a, b, bufPool, start)
 	if tc, ok := a.(interface{ CloseWrite() error }); ok {
 		_ = tc.CloseWrite()
 	} else {
 		_ = a.SetReadDeadline(time.Now())
 	}
 
-	bToA := <-done
+	aToB := <-aToBDone
 	return RelayStats{
 		AToB:     aToB,
 		BToA:     bToA,

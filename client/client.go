@@ -306,9 +306,7 @@ func (c *Client) handleStream(stream *tunnel.MuxStream) {
 		"dial_target", dialElapsed.Round(time.Millisecond),
 		"setup_total", time.Since(start).Round(time.Millisecond))
 
-	// relay returns (fromB, fromA) where a=stream, b=targetConn:
-	//   fromB = bytes from targetConn written to stream (target response)
-	//   fromA = bytes from stream written to targetConn (data forwarded to target)
+	// Relay reports AToB as stream -> targetConn and BToA as targetConn -> stream.
 	relayStart := time.Now()
 	stats := pkg.Relay(stream, targetConn, &relayBufPool)
 	slog.Info("relay done", "target", target,
