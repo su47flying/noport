@@ -168,6 +168,7 @@ func (c *Client) connectData() error {
 	if err != nil {
 		return fmt.Errorf("dial data: %w", err)
 	}
+	pkg.TuneDataConn(conn)
 
 	session, err := c.dataQueue.AddConn(conn)
 	if err != nil {
@@ -222,7 +223,7 @@ func (c *Client) monitorDataConns() {
 				infos := c.dataQueue.DetailedStats()
 				dist := make([]string, len(infos))
 				for i, info := range infos {
-					dist[i] = fmt.Sprintf("s%d:%d", info.ID, info.Streams)
+					dist[i] = fmt.Sprintf("s%d:%d/%dKB", info.ID, info.Streams, info.Inflight/1024)
 				}
 				slog.Debug("data pool status",
 					"pool_size", poolSize,

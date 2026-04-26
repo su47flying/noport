@@ -60,7 +60,12 @@ func (dq *DataQueue) AddConn(conn net.Conn) (*MuxSession, error) {
 	return session, nil
 }
 
-// GetSession returns an active MuxSession from the pool using least-loaded selection.
+// GetSession returns an active MuxSession from the pool using a
+// bandwidth-aware least-loaded selection: the session with the smallest
+// write backlog (queued + in-flight bytes) wins, with stream count as
+// the tiebreaker. This prevents a heavy stream (e.g. video) from dragging
+// unrelated streams placed on the same TCP — new streams naturally land
+// on idle sessions instead of stacking on the busiest one.
 // Skips closed sessions. Returns error if pool is empty or closed.
 func (dq *DataQueue) GetSession() (*MuxSession, error) {
 	dq.mu.RLock()
@@ -71,7 +76,8 @@ func (dq *DataQueue) GetSession() (*MuxSession, error) {
 	}
 
 	var best *MuxSession
-	bestStreams := -1
+	var bestInflight int64
+	var bestStreams int
 	aliveCount := 0
 
 	for _, s := range dq.sessions {
@@ -79,10 +85,14 @@ func (dq *DataQueue) GetSession() (*MuxSession, error) {
 			continue
 		}
 		aliveCount++
-		n := s.NumStreams()
-		if best == nil || n < bestStreams {
+		inflight := s.InflightBytes()
+		streams := s.NumStreams()
+		if best == nil ||
+			inflight < bestInflight ||
+			(inflight == bestInflight && streams < bestStreams) {
 			best = s
-			bestStreams = n
+			bestInflight = inflight
+			bestStreams = streams
 		}
 	}
 
@@ -90,7 +100,12 @@ func (dq *DataQueue) GetSession() (*MuxSession, error) {
 		return nil, ErrNoConnections
 	}
 
-	slog.Debug("data queue: selected session", "session_id", best.ID(), "streams", bestStreams, "pool_size", aliveCount)
+	slog.Debug("data queue: selected session",
+		"session_id", best.ID(),
+		"inflight_bytes", bestInflight,
+		"streams", bestStreams,
+		"pool_size", aliveCount,
+	)
 	return best, nil
 }
 
@@ -183,9 +198,10 @@ func (dq *DataQueue) Close() error {
 
 // SessionInfo holds per-session stats for observability logging.
 type SessionInfo struct {
-	ID      uint64
-	Streams int
-	Closed  bool
+	ID       uint64
+	Streams  int
+	Inflight int64
+	Closed   bool
 }
 
 // DetailedStats returns per-session info for periodic logging.
@@ -194,7 +210,12 @@ func (dq *DataQueue) DetailedStats() []SessionInfo {
 	defer dq.mu.RUnlock()
 	infos := make([]SessionInfo, len(dq.sessions))
 	for i, s := range dq.sessions {
-		infos[i] = SessionInfo{ID: s.ID(), Streams: s.NumStreams(), Closed: s.IsClosed()}
+		infos[i] = SessionInfo{
+			ID:       s.ID(),
+			Streams:  s.NumStreams(),
+			Inflight: s.InflightBytes(),
+			Closed:   s.IsClosed(),
+		}
 	}
 	return infos
 }

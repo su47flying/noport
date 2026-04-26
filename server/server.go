@@ -250,7 +250,7 @@ func (s *Server) listenData(addr string) error {
 				infos := s.dataQueue.DetailedStats()
 				dist := make([]string, len(infos))
 				for i, info := range infos {
-					dist[i] = fmt.Sprintf("s%d:%d", info.ID, info.Streams)
+					dist[i] = fmt.Sprintf("s%d:%d/%dKB", info.ID, info.Streams, info.Inflight/1024)
 				}
 				slog.Debug("data pool status",
 					"pool_size", poolSize,
@@ -276,6 +276,7 @@ func (s *Server) listenData(addr string) error {
 		}
 
 		slog.Info("data connection added", "remote", conn.RemoteAddr())
+		pkg.TuneDataConn(conn)
 		if _, err := s.dataQueue.AddConn(conn); err != nil {
 			slog.Error("failed to add data connection", "err", err)
 			conn.Close()
