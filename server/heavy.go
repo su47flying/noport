@@ -10,10 +10,11 @@ import (
 // same host are then routed onto a dedicated MuxSession so head-of-line
 // blocking on the shared pool can no longer stall unrelated traffic.
 //
-// 4 MiB is well past the size of typical control/HTTP traffic but small
-// enough to react within the first segment of a 1080p video stream
-// (~1–4 s of playback).
-const PromoteThresholdBytes int64 = 4 << 20
+// 2 MiB is past the size of typical control / page-load traffic but small
+// enough to react within a single video segment (HLS / DASH typically
+// emit 1–4 MiB segments at 1080p). The previous 4 MiB ceiling never
+// fired in practice because each segment closes before the threshold.
+const PromoteThresholdBytes int64 = 2 << 20
 
 // promoteWatchConn wraps a net.Conn and counts bytes flowing in either
 // direction. When the cumulative count first crosses PromoteThresholdBytes

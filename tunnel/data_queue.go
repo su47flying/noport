@@ -207,10 +207,20 @@ func (dq *DataQueue) pickLocked(host string, reservedOK bool) (*MuxSession, erro
 
 // pickLockedUnreserved returns the least-loaded session that has no
 // existing reservation. Caller must hold mu (write or read).
+// pickLockedUnreserved selects an unreserved session to dedicate to a
+// new heavy host. It prefers an *idle* session (NumStreams==0) so the
+// new dedicated session starts truly empty; only if none exists does it
+// fall back to the least-loaded unreserved session. Without this
+// preference a heavy reservation could land on a session that already
+// hosts unrelated streams, leaving them exposed to the heavy host's
+// backpressure until they finish.
 func (dq *DataQueue) pickLockedUnreserved() (*MuxSession, error) {
-	var best *MuxSession
-	var bestInflight int64
-	var bestStreams int
+	var bestIdle *MuxSession
+	var bestIdleInflight int64
+
+	var bestAny *MuxSession
+	var bestAnyInflight int64
+	var bestAnyStreams int
 
 	for _, s := range dq.sessions {
 		if s.IsClosed() {
@@ -219,20 +229,29 @@ func (dq *DataQueue) pickLockedUnreserved() (*MuxSession, error) {
 		if _, reserved := dq.reservations[s.ID()]; reserved {
 			continue
 		}
-		inflight := s.InflightBytes()
 		streams := s.NumStreams()
-		if best == nil ||
-			inflight < bestInflight ||
-			(inflight == bestInflight && streams < bestStreams) {
-			best = s
-			bestInflight = inflight
-			bestStreams = streams
+		inflight := s.InflightBytes()
+		if streams == 0 {
+			if bestIdle == nil || inflight < bestIdleInflight {
+				bestIdle = s
+				bestIdleInflight = inflight
+			}
+		}
+		if bestAny == nil ||
+			inflight < bestAnyInflight ||
+			(inflight == bestAnyInflight && streams < bestAnyStreams) {
+			bestAny = s
+			bestAnyInflight = inflight
+			bestAnyStreams = streams
 		}
 	}
-	if best == nil {
+	if bestIdle != nil {
+		return bestIdle, nil
+	}
+	if bestAny == nil {
 		return nil, ErrNoConnections
 	}
-	return best, nil
+	return bestAny, nil
 }
 
 // HostOnly returns the host portion of a "host:port" target. Falls back

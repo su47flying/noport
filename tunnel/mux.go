@@ -33,10 +33,13 @@ const (
 	writeChunkSize = 16 * 1024
 
 	// writeDeadline bounds the time a single frame may spend in conn.Write.
-	// If exceeded, the underlying TCP is treated as dead and the session is
-	// torn down so the data-queue pool can replace it. This protects against
-	// silently stuck connections (NAT half-open, route flaps, peer wedged).
-	writeDeadline = 30 * time.Second
+	// This is a *catastrophic-stall* safety net, NOT a congestion detector.
+	// A multiplexed TCP carrying video over a constrained upstream may
+	// legitimately block for tens of seconds while the kernel send buffer
+	// drains; killing the session in that window would tear down every
+	// unrelated stream sharing it (the regression observed in v0.0.7).
+	// Idle / dead-peer detection is handled by TCP keepalive (pkg.TuneTCP).
+	writeDeadline = 10 * time.Minute
 )
 
 // sessionIDCounter assigns a unique ID to each MuxSession for logging.

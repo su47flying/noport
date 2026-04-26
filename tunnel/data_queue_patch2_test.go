@@ -207,3 +207,43 @@ func TestReleaseExpiredReservationsReturnsSessionToSharedPool(t *testing.T) {
 		t.Fatal("freed session never reselected by shared pool")
 	}
 }
+
+func TestHeavyHostPrefersIdleSession(t *testing.T) {
+dq := NewDataQueue(nil, true)
+defer dq.Close()
+hh := NewHeavyHostSet(time.Hour)
+defer hh.Close()
+
+sessions := addThree(t, dq)
+
+// Inject a fake live stream into sessions[0] and sessions[2]; leave
+// sessions[1] truly idle. The heavy reservation MUST land on the
+// idle one so the dedicated session starts empty.
+for _, idx := range []int{0, 2} {
+s := sessions[idx]
+s.mu.Lock()
+s.streams[uint32(idx+1)] = &MuxStream{}
+s.mu.Unlock()
+}
+defer func() {
+for _, idx := range []int{0, 2} {
+s := sessions[idx]
+s.mu.Lock()
+delete(s.streams, uint32(idx+1))
+s.mu.Unlock()
+}
+}()
+
+hh.Mark("video.example.com")
+got, reserved, err := dq.GetSessionForTarget("video.example.com:443", hh)
+if err != nil {
+t.Fatalf("GetSessionForTarget: %v", err)
+}
+if !reserved {
+t.Fatal("expected reservation")
+}
+if got != sessions[1] {
+t.Fatalf("expected idle session %d, got %d (streams=%d)",
+sessions[1].ID(), got.ID(), got.NumStreams())
+}
+}

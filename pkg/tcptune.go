@@ -8,9 +8,12 @@ import (
 
 // dataKeepAlivePeriod is the interval between TCP keepalive probes on
 // long-lived data connections. Tuned aggressively (vs. the OS default of
-// ~2 hours) so a silently dead path is detected within roughly one minute,
-// which matches the mux write deadline and prevents stuck conn.Write from
-// dragging unrelated streams.
+// ~2 hours) so a silently dead path is detected within roughly one
+// minute. This is the *primary* dead-peer detector for the data pool;
+// the mux's per-frame write deadline is only a catastrophic-stall
+// safety net (see tunnel/mux.go writeDeadline) and must not be relied
+// on for normal congestion or NAT timeout detection — it would mistake
+// upstream backpressure for a dead socket.
 const dataKeepAlivePeriod = 30 * time.Second
 
 // TuneDataConn applies socket options appropriate for noport's long-lived
