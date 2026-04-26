@@ -11,7 +11,7 @@ import (
 )
 
 // Set via -ldflags at build time, defaults to "dev"
-var version = "0.0.9"
+var version = "0.0.10"
 
 func main() {
 	// Handle -version before flag.Parse (which happens in ParseConfig)
